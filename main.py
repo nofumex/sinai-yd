@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
+import io
 import json
 import os
 import re
@@ -290,6 +292,22 @@ def process_task(
     raise ValueError(f"Unknown task kind: {task.get('kind')}")
 
 
+def process_task_logged(
+    task: dict[str, Any],
+    args: argparse.Namespace,
+    amo: sync.AmoClient,
+    disk: sync.YandexDiskClient,
+    store: sync.Store,
+) -> dict[str, int | str]:
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+        result = process_task(task, args, amo, disk, store)
+    output = buffer.getvalue().strip()
+    if output:
+        write_log(output)
+    return result
+
+
 def process_event_task(event: dict[str, Any], args: argparse.Namespace, amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> dict[str, int | str]:
     field_id = amo.resolve_folder_field_id()
     allowed = amo.allowed_pipeline_ids()
@@ -382,7 +400,7 @@ def run_monitor_cycle(
     too_many_disk = len(disk_tasks) > 5
     if too_many_events or too_many_disk:
         first, rest = tasks[0], tasks[1:]
-        result = process_task(first, args, amo, disk, store)
+        result = process_task_logged(first, args, amo, disk, store)
         apply_result(check, result)
         batch = {
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -398,7 +416,7 @@ def run_monitor_cycle(
         )
     else:
         for task in tasks:
-            result = process_task(task, args, amo, disk, store)
+            result = process_task_logged(task, args, amo, disk, store)
             apply_result(check, result)
 
     state.total_uploaded += check.uploaded
@@ -425,7 +443,7 @@ def process_pending_batch(args: argparse.Namespace, amo: sync.AmoClient, disk: s
         check.notes.append("Нет ожидающей пачки.")
         return check
     for task in batch.get("tasks") or []:
-        result = process_task(task, args, amo, disk, store)
+        result = process_task_logged(task, args, amo, disk, store)
         apply_result(check, result)
     clear_pending_batch(store)
     state.total_uploaded += check.uploaded
@@ -645,6 +663,12 @@ def main() -> int:
         handle_updates(tg, worker_args, amo, disk, store, state)
         if monitor_enabled(store):
             try:
+                state.last_check = LastCheck(
+                    checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    notes=["⏳ Идет проверка и синхронизация..."],
+                )
+                panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
+                tg.edit_panel(panel_text, keyboard)
                 run_monitor_cycle(worker_args, amo, disk, store, state)
             except Exception as exc:
                 state.total_errors += 1
