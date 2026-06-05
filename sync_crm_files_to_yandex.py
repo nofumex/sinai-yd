@@ -697,9 +697,13 @@ class YandexDiskClient:
             "/resources/upload",
             params={"path": target_path, "overwrite": str(overwrite).lower()},
         )
+        if response.status_code == 409:
+            response.raise_for_status()
         href = response.json()["href"]
         with local_path.open("rb") as handle:
             upload_response = requests.put(href, data=handle, timeout=600)
+        if upload_response.status_code == 409:
+            upload_response.raise_for_status()
         upload_response.raise_for_status()
 
 
