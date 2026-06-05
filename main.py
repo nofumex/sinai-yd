@@ -599,6 +599,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--reset-panel", action="store_true", help="Delete the known panel message and create a fresh one.")
+    parser.add_argument("--approve-pending", action="store_true", help="Process the pending batch and exit.")
+    parser.add_argument("--reject-pending", action="store_true", help="Mark the pending batch as skipped and exit.")
     args = parser.parse_args()
     worker_args = base_worker_args(args)
 
@@ -608,6 +610,26 @@ def main() -> int:
     store = sync.Store()
     tg = TelegramUI(store)
     state = AppState(started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    if args.approve_pending:
+        store.set_setting(PENDING_PROCESSING_KEY, "yes")
+        panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
+        tg.edit_panel(panel_text, keyboard)
+        check = process_pending_batch(worker_args, amo, disk, store, state)
+        write_log("Pending batch processed from CLI\n" + json.dumps(check.__dict__, ensure_ascii=False))
+        panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
+        tg.edit_panel(panel_text, keyboard)
+        return 0 if check.errors == 0 else 1
+
+    if args.reject_pending:
+        store.set_setting(PENDING_PROCESSING_KEY, "no")
+        panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
+        tg.edit_panel(panel_text, keyboard)
+        skip_pending_batch(store)
+        state.last_check.notes.append("Ожидающая пачка пропущена из CLI.")
+        panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
+        tg.edit_panel(panel_text, keyboard)
+        return 0
 
     if args.reset_panel:
         old_id = tg.panel_message_id()
