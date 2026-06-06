@@ -9,7 +9,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,9 @@ PENDING_PROCESSING_KEY = "telegram_pending_processing"
 PANEL_MESSAGE_KEY = "telegram_panel_message_id"
 TG_OFFSET_KEY = "telegram_update_offset"
 MONITOR_ENABLED_KEY = "monitor_enabled"
+
+
+LOCAL_TZ = timezone(timedelta(hours=int(sync.env("LOCAL_TZ_OFFSET_HOURS", "7"))))
 
 
 @dataclass
@@ -160,7 +163,7 @@ def html(value: Any) -> str:
 
 def write_log(text: str) -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = LOG_DIR / f"main_{datetime.now().strftime('%Y-%m-%d')}.log"
+    path = LOG_DIR / f"main_{now_dt().strftime('%Y-%m-%d')}.log"
     with path.open("a", encoding="utf-8") as handle:
         handle.write(sanitize_log_text(text).rstrip() + "\n")
 
@@ -379,7 +382,7 @@ def run_monitor_cycle(
     store: sync.Store,
     state: AppState,
 ) -> None:
-    check = LastCheck(checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    check = LastCheck(checked_at=now_str())
     state.cycles += 1
 
     if pending_batch(store):
@@ -407,7 +410,7 @@ def run_monitor_cycle(
         result = process_task_logged(first, args, amo, disk, store)
         apply_result(check, result)
         batch = {
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "created_at": now_str(),
             "field_events": len(event_tasks),
             "disk_folders": len(disk_tasks),
             "done_first": task_public_links(first),
@@ -442,7 +445,7 @@ def apply_result(check: LastCheck, result: dict[str, int | str]) -> None:
 
 def process_pending_batch(args: argparse.Namespace, amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store, state: AppState) -> LastCheck:
     batch = pending_batch(store)
-    check = LastCheck(checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), period="pending batch")
+    check = LastCheck(checked_at=now_str(), period="pending batch")
     if not batch:
         check.notes.append("Нет ожидающей пачки.")
         return check
@@ -606,7 +609,15 @@ def handle_updates(
 
 
 def fmt_time(timestamp: int) -> str:
-    return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.fromtimestamp(timestamp, LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def now_dt() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+
+def now_str() -> str:
+    return now_dt().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def html(value: Any) -> str:
@@ -631,7 +642,7 @@ def main() -> int:
     disk = sync.YandexDiskClient()
     store = sync.Store()
     tg = TelegramUI(store)
-    state = AppState(started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    state = AppState(started_at=now_str())
 
     if args.approve_pending:
         store.set_setting(PENDING_PROCESSING_KEY, "yes")
@@ -668,7 +679,7 @@ def main() -> int:
         if monitor_enabled(store):
             try:
                 state.last_check = LastCheck(
-                    checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    checked_at=now_str(),
                     notes=["⏳ Идет проверка и синхронизация..."],
                 )
                 panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
@@ -677,7 +688,7 @@ def main() -> int:
             except Exception as exc:
                 state.total_errors += 1
                 state.last_error = str(exc)
-                state.last_check = LastCheck(checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"), errors=1, notes=[f"fatal cycle error: {exc}"])
+                state.last_check = LastCheck(checked_at=now_str(), errors=1, notes=[f"fatal cycle error: {exc}"])
                 write_log(f"fatal cycle error: {exc}")
 
         panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
