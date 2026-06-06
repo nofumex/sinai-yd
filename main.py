@@ -76,16 +76,20 @@ class TelegramUI:
         if not self.enabled:
             return []
         offset = self.store.get_setting_int(TG_OFFSET_KEY, 0)
-        response = self.session.get(
-            f"{self.base_url}/getUpdates",
-            params={"offset": offset, "timeout": 1},
-            timeout=10,
-        )
-        response.raise_for_status()
-        updates = response.json().get("result") or []
-        if updates:
-            self.store.set_setting_int(TG_OFFSET_KEY, int(updates[-1]["update_id"]) + 1)
-        return updates
+        try:
+            response = self.session.get(
+                f"{self.base_url}/getUpdates",
+                params={"offset": offset, "timeout": 1},
+                timeout=20,
+            )
+            response.raise_for_status()
+            updates = response.json().get("result") or []
+            if updates:
+                self.store.set_setting_int(TG_OFFSET_KEY, int(updates[-1]["update_id"]) + 1)
+            return updates
+        except Exception as exc:
+            write_log(f"Telegram getUpdates failed, continuing: {exc}")
+            return []
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         try:
