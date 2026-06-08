@@ -732,12 +732,23 @@ class YandexDiskClient:
         return True
 
     def list_dir(self, folder_path: str, limit: int = 1000) -> list[dict[str, Any]]:
-        response = self.request(
-            "GET",
-            "/resources",
-            params={"path": normalize_disk_path(folder_path), "limit": min(max(limit, 1), 1000)},
-        )
-        return response.json().get("_embedded", {}).get("items", []) or []
+        path = normalize_disk_path(folder_path)
+        page_limit = min(max(limit, 1), 1000)
+        offset = 0
+        result: list[dict[str, Any]] = []
+        while True:
+            response = self.request(
+                "GET",
+                "/resources",
+                params={"path": path, "limit": page_limit, "offset": offset},
+            )
+            embedded = response.json().get("_embedded", {}) or {}
+            batch = embedded.get("items", []) or []
+            result.extend(batch)
+            total = int(embedded.get("total") or 0)
+            offset += len(batch)
+            if not batch or len(batch) < page_limit or (total and offset >= total):
+                return result
 
     def upload_file(self, local_path: Path, target_path: str, overwrite: bool = False) -> None:
         response = self.request(
