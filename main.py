@@ -319,6 +319,15 @@ def process_task(
     raise ValueError(f"Unknown task kind: {task.get('kind')}")
 
 
+def task_log_label(task: dict[str, Any]) -> str:
+    if task.get("kind") == "event":
+        event = task.get("event") or {}
+        return f"field event lead={int(event.get('entity_id') or 0)} event={event.get('id') or ''}"
+    if task.get("kind") == "disk_folder":
+        return f"disk folder lead={int(task.get('lead_id') or 0)} folder={task.get('folder_name') or ''}"
+    return str(task.get("kind") or "task")
+
+
 def process_task_logged(
     task: dict[str, Any],
     args: argparse.Namespace,
@@ -326,12 +335,18 @@ def process_task_logged(
     disk: sync.YandexDiskClient,
     store: sync.Store,
 ) -> dict[str, int | str]:
+    label = task_log_label(task)
+    trace_log(f"task start {label}")
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
         result = process_task(task, args, amo, disk, store)
     output = buffer.getvalue().strip()
     if output:
         write_log(output)
+    trace_log(
+        f"task done {label} uploaded={int(result.get('uploaded') or 0)} "
+        f"skipped={int(result.get('skipped') or 0)} errors={int(result.get('errors') or 0)}"
+    )
     return result
 
 
