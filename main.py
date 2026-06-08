@@ -282,13 +282,19 @@ def discover_disk_tasks(amo: sync.AmoClient, disk: sync.YandexDiskClient, store:
     folders = [item for item in disk.list_dir(root) if item.get("type") == "dir"]
     trace_log(f"disk scan listed folders={len(folders)} root=disk:/{root}")
     tasks: list[dict[str, Any]] = []
-    for folder in folders:
+    for index, folder in enumerate(folders, start=1):
         folder_name = str(folder.get("name") or "")
         folder_path = str(folder.get("path") or "").replace("disk:/", "", 1)
         if not folder_path or store.has_disk_folder(folder_path):
             continue
+        folder_modified = str(folder.get("modified") or folder.get("created") or "")
+        if store.has_disk_folder_no_match(folder_path, folder_modified):
+            continue
+        if index == 1 or index % 10 == 0 or index == len(folders):
+            trace_log(f"disk scan progress checked={index}/{len(folders)} new={len(tasks)}")
         lead = sync.find_lead_for_disk_folder(amo, folder_name, allowed)
         if not lead:
+            store.save_disk_folder_no_match(folder_path, folder_name, folder_modified)
             continue
         tasks.append({"kind": "disk_folder", "folder_name": folder_name, "folder_path": folder_path, "lead_id": int(lead["id"])})
     trace_log(f"disk scan done folders={len(folders)} new={len(tasks)}")

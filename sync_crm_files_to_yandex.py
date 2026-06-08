@@ -238,6 +238,13 @@ class Store:
                     field_value text not null,
                     processed_at integer not null
                 );
+
+                create table if not exists disk_folder_no_match (
+                    folder_path text primary key,
+                    folder_name text not null,
+                    folder_modified text not null,
+                    scanned_at integer not null
+                );
                 """
             )
 
@@ -334,6 +341,27 @@ class Store:
                 values(?, ?, ?, ?)
                 """,
                 (folder_path, lead_id, field_value, int(time.time())),
+            )
+
+    def has_disk_folder_no_match(self, folder_path: str, folder_modified: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select 1 from disk_folder_no_match
+                where folder_path = ? and folder_modified = ?
+                """,
+                (folder_path, folder_modified),
+            ).fetchone()
+        return bool(row)
+
+    def save_disk_folder_no_match(self, folder_path: str, folder_name: str, folder_modified: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert or replace into disk_folder_no_match(folder_path, folder_name, folder_modified, scanned_at)
+                values(?, ?, ?, ?)
+                """,
+                (folder_path, folder_name, folder_modified, int(time.time())),
             )
 
 
