@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -328,6 +329,23 @@ def task_log_label(task: dict[str, Any]) -> str:
     return str(task.get("kind") or "task")
 
 
+class TeeBuffer:
+    def __init__(self) -> None:
+        self.buffer = io.StringIO()
+
+    def write(self, text: str) -> int:
+        self.buffer.write(text)
+        sys.__stdout__.write(sanitize_log_text(text))
+        sys.__stdout__.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def getvalue(self) -> str:
+        return self.buffer.getvalue()
+
+
 def process_task_logged(
     task: dict[str, Any],
     args: argparse.Namespace,
@@ -337,7 +355,7 @@ def process_task_logged(
 ) -> dict[str, int | str]:
     label = task_log_label(task)
     trace_log(f"task start {label}")
-    buffer = io.StringIO()
+    buffer = TeeBuffer()
     with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
         result = process_task(task, args, amo, disk, store)
     output = buffer.getvalue().strip()
@@ -366,12 +384,18 @@ def process_event_task(event: dict[str, Any], args: argparse.Namespace, amo: syn
         if not args.dry_run:
             store.save_event(event)
         return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} empty folder"}
+    try:
+        folder = sync.crm_files_folder_in_configured_root(raw_folder)
+    except ValueError as exc:
+        if not args.dry_run:
+            store.save_event(event)
+        return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} skipped folder outside root: {exc}"}
     stats = sync.sync_lead(
         amo,
         disk,
         store,
         lead,
-        sync.crm_files_folder(raw_folder),
+        folder,
         force=args.force,
         dry_run=args.dry_run,
         include_contact_notes=not args.no_contact_notes,

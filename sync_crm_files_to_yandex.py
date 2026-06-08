@@ -172,6 +172,26 @@ def crm_files_folder(client_folder: str) -> str:
     return f"{folder}/{subfolder}"
 
 
+def configured_disk_root() -> str:
+    return normalize_disk_path(env("YANDEX_DISK_SCAN_ROOT", env("YANDEX_DISK_TEST_ROOT", "test-CRM")))
+
+
+def is_disk_path_under_root(path: str, root: str | None = None) -> bool:
+    folder = normalize_disk_path(path)
+    allowed_root = normalize_disk_path(root or configured_disk_root())
+    folder_key = folder.casefold()
+    root_key = allowed_root.casefold()
+    return folder_key == root_key or folder_key.startswith(root_key + "/")
+
+
+def crm_files_folder_in_configured_root(client_folder: str) -> str:
+    folder = normalize_disk_path(client_folder)
+    root = configured_disk_root()
+    if not is_disk_path_under_root(folder, root):
+        raise ValueError(f"folder is outside configured Yandex Disk root disk:/{root}")
+    return crm_files_folder(folder)
+
+
 def yandex_client_url(folder_path: str) -> str:
     path = normalize_disk_path(folder_path)
     return "https://disk.yandex.ru/client/disk/" + quote(path, safe="/()_-.,")
@@ -949,10 +969,10 @@ def command_sync_field_leads(args: argparse.Namespace) -> int:
             continue
 
         try:
-            folder = crm_files_folder(raw_folder)
+            folder = crm_files_folder_in_configured_root(raw_folder)
         except ValueError as exc:
-            total["errors"] += 1
-            print(f"Lead {lead_id}: bad folder value {raw_folder!r}: {exc}")
+            total["skipped"] += 1
+            print(f"Lead {lead_id}: skip folder outside configured root {raw_folder!r}: {exc}")
             continue
 
         stats = sync_lead(
@@ -991,10 +1011,10 @@ def command_sync_by_field(args: argparse.Namespace) -> int:
     for lead in leads:
         raw_folder = lead_folder_value(lead, field_id)
         try:
-            folder = crm_files_folder(raw_folder)
+            folder = crm_files_folder_in_configured_root(raw_folder)
         except ValueError as exc:
-            total["errors"] += 1
-            print(f"Lead {lead.get('id')}: bad folder value {raw_folder!r}: {exc}")
+            total["skipped"] += 1
+            print(f"Lead {lead.get('id')}: skip folder outside configured root {raw_folder!r}: {exc}")
             continue
         stats = sync_lead(
             amo,
@@ -1071,7 +1091,14 @@ def sync_field_events_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
                     store.save_event(event)
                 continue
 
-            folder = crm_files_folder(raw_folder)
+            try:
+                folder = crm_files_folder_in_configured_root(raw_folder)
+            except ValueError as exc:
+                total["skipped"] += 1
+                print(f"Event {event_id}: skip lead={lead_id} folder outside configured root {raw_folder!r}: {exc}")
+                if not args.dry_run:
+                    store.save_event(event)
+                continue
             stats = sync_lead(
                 amo,
                 disk,
