@@ -168,6 +168,11 @@ def write_log(text: str) -> None:
         handle.write(sanitize_log_text(text).rstrip() + "\n")
 
 
+def trace_log(text: str) -> None:
+    write_log(text)
+    print(sanitize_log_text(text), flush=True)
+
+
 def sanitize_log_text(text: str) -> str:
     text = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot***", str(text))
     replacements = [
@@ -262,16 +267,20 @@ def discover_event_tasks(args: argparse.Namespace, amo: sync.AmoClient, store: s
     saved_ts = store.get_setting_int(setting_key, 0)
     fallback = now - int(args.lookback_hours * 3600)
     from_ts = max(0, saved_ts - 60) if saved_ts else fallback
+    trace_log(f"event scan start field_id={field_id} from={fmt_time(from_ts)} to={fmt_time(now)}")
     events = amo.list_field_change_events(field_id, from_ts=from_ts, to_ts=now)
     tasks = [{"kind": "event", "event": event} for event in events if not store.has_event(str(event.get("id") or ""))]
     period = f"{fmt_time(from_ts)} - {fmt_time(now)}"
+    trace_log(f"event scan done seen={len(events)} new={len(tasks)}")
     return tasks, len(events), period
 
 
 def discover_disk_tasks(amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> tuple[list[dict[str, Any]], int]:
     allowed = amo.allowed_pipeline_ids()
     root = sync.normalize_disk_path(sync.env("YANDEX_DISK_SCAN_ROOT", sync.env("YANDEX_DISK_TEST_ROOT", "test-CRM")))
+    trace_log(f"disk scan start root=disk:/{root}")
     folders = [item for item in disk.list_dir(root) if item.get("type") == "dir"]
+    trace_log(f"disk scan listed folders={len(folders)} root=disk:/{root}")
     tasks: list[dict[str, Any]] = []
     for folder in folders:
         folder_name = str(folder.get("name") or "")
@@ -282,6 +291,7 @@ def discover_disk_tasks(amo: sync.AmoClient, disk: sync.YandexDiskClient, store:
         if not lead:
             continue
         tasks.append({"kind": "disk_folder", "folder_name": folder_name, "folder_path": folder_path, "lead_id": int(lead["id"])})
+    trace_log(f"disk scan done folders={len(folders)} new={len(tasks)}")
     return tasks, len(folders)
 
 
@@ -384,6 +394,7 @@ def run_monitor_cycle(
 ) -> None:
     check = LastCheck(checked_at=now_str())
     state.cycles += 1
+    trace_log(f"cycle {state.cycles} start dry_run={args.dry_run}")
 
     if pending_batch(store):
         check.notes.append("Есть ожидающая подтверждения пачка, новые задачи не запускаются.")
@@ -401,6 +412,7 @@ def run_monitor_cycle(
     tasks = event_tasks + disk_tasks
     if not tasks:
         state.last_check = check
+        trace_log(f"cycle {state.cycles} done no tasks event_seen={event_seen} disk_seen={disk_seen}")
         return
 
     too_many_events = len(event_tasks) > 5
@@ -431,6 +443,7 @@ def run_monitor_cycle(
     if check.errors:
         state.last_error = "; ".join(check.notes[-3:]) or "Есть ошибки в последнем цикле"
     state.last_check = check
+    trace_log(f"cycle {state.cycles} done tasks={check.processed_tasks} uploaded={check.uploaded} skipped={check.skipped} errors={check.errors}")
 
 
 def apply_result(check: LastCheck, result: dict[str, int | str]) -> None:
