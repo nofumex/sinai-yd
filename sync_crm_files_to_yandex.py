@@ -716,9 +716,24 @@ class YandexDiskClient:
         current = ""
         for part in parts:
             current = f"{current}/{part}" if current else part
-            response = self.request("PUT", "/resources", params={"path": current})
-            if response.status_code not in {201, 409}:
-                response.raise_for_status()
+            if self.exists(current):
+                continue
+            last_response: requests.Response | None = None
+            for attempt in range(1, 4):
+                response = self.session.put(
+                    "https://cloud-api.yandex.net/v1/disk/resources",
+                    params={"path": current},
+                    timeout=90,
+                )
+                if response.status_code in {201, 409}:
+                    break
+                if response.status_code == 423 and attempt < 3:
+                    time.sleep(attempt * 2)
+                    continue
+                last_response = response
+                break
+            if last_response is not None:
+                last_response.raise_for_status()
 
     def exists(self, path: str) -> bool:
         response = self.session.get(

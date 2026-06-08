@@ -751,7 +751,7 @@ def main() -> int:
                 state.total_errors += 1
                 state.last_error = str(exc)
                 state.last_check = LastCheck(checked_at=now_str(), errors=1, notes=[f"fatal cycle error: {exc}"])
-                write_log(f"fatal cycle error: {exc}")
+                trace_log(f"fatal cycle error: {exc}")
 
         panel_text, keyboard = render_panel(state, store, worker_args, view="monitor")
         tg.edit_panel(panel_text, keyboard)
