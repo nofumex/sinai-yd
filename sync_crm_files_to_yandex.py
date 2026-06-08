@@ -1177,7 +1177,11 @@ def scan_disk_folders_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
 
 
 def find_lead_for_disk_folder(amo: AmoClient, folder_name: str, allowed: dict[int, str]) -> dict[str, Any] | None:
-    for candidate_id in folder_candidate_ids(folder_name):
+    candidate_ids = folder_candidate_ids(folder_name)
+    if not candidate_ids:
+        return None
+
+    for candidate_id in candidate_ids:
         try:
             lead = amo.get_lead(candidate_id)
         except requests.HTTPError as exc:
@@ -1187,21 +1191,7 @@ def find_lead_for_disk_folder(amo: AmoClient, folder_name: str, allowed: dict[in
         if int(lead.get("pipeline_id") or 0) in allowed:
             return lead
 
-    query = folder_search_query(folder_name)
-    if not query:
-        return None
-    candidates = amo.search_leads(query, limit=25)
-    allowed_candidates = [lead for lead in candidates if int(lead.get("pipeline_id") or 0) in allowed]
-    if not allowed_candidates:
-        return None
-
-    normalized_query = normalize_match_text(query)
-    exact = [
-        lead
-        for lead in allowed_candidates
-        if normalize_match_text(str(lead.get("name") or "")) == normalized_query
-    ]
-    return (exact or allowed_candidates)[0]
+    return None
 
 
 def folder_candidate_ids(folder_name: str) -> list[int]:
