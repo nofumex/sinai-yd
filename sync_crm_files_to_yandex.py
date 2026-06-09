@@ -192,6 +192,43 @@ def crm_files_folder_in_configured_root(client_folder: str) -> str:
     return crm_files_folder(folder)
 
 
+def is_public_disk_url(raw: str) -> bool:
+    value = extract_disk_value(raw)
+    if not value:
+        return False
+    parsed = urlparse(value)
+    return parsed.netloc in {"disk.yandex.ru", "yadi.sk"} and parsed.path.startswith("/d/")
+
+
+def public_disk_resource(public_url: str) -> dict[str, Any]:
+    response = requests.get(
+        "https://cloud-api.yandex.net/v1/disk/public/resources",
+        params={"public_key": extract_disk_value(public_url)},
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def private_folder_from_public_url(public_url: str, disk: "YandexDiskClient") -> str:
+    resource = public_disk_resource(public_url)
+    if str(resource.get("type") or "") != "dir":
+        raise ValueError("public Yandex Disk link must point to a folder")
+    folder_name = str(resource.get("name") or "").strip()
+    if not folder_name:
+        raise ValueError("public Yandex Disk folder name is empty")
+    folder = f"{configured_disk_root()}/{folder_name}"
+    if not disk.exists(folder):
+        raise ValueError(f"public folder was resolved to disk:/{folder}, but this folder is not in configured root")
+    return folder
+
+
+def crm_files_folder_from_field_value(raw_folder: str, disk: "YandexDiskClient") -> str:
+    if is_public_disk_url(raw_folder):
+        return crm_files_folder(private_folder_from_public_url(raw_folder, disk))
+    return crm_files_folder_in_configured_root(raw_folder)
+
+
 def yandex_client_url(folder_path: str) -> str:
     path = normalize_disk_path(folder_path)
     return "https://disk.yandex.ru/client/disk/" + quote_readable_disk_path(path)
@@ -1008,7 +1045,7 @@ def command_sync_field_leads(args: argparse.Namespace) -> int:
             continue
 
         try:
-            folder = crm_files_folder_in_configured_root(raw_folder)
+            folder = crm_files_folder_from_field_value(raw_folder, disk)
         except ValueError as exc:
             total["skipped"] += 1
             print(f"Lead {lead_id}: skip folder outside configured root {raw_folder!r}: {exc}")
@@ -1050,7 +1087,7 @@ def command_sync_by_field(args: argparse.Namespace) -> int:
     for lead in leads:
         raw_folder = lead_folder_value(lead, field_id)
         try:
-            folder = crm_files_folder_in_configured_root(raw_folder)
+            folder = crm_files_folder_from_field_value(raw_folder, disk)
         except ValueError as exc:
             total["skipped"] += 1
             print(f"Lead {lead.get('id')}: skip folder outside configured root {raw_folder!r}: {exc}")
@@ -1141,7 +1178,7 @@ def sync_field_events_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
                 continue
 
             try:
-                folder = crm_files_folder_in_configured_root(raw_folder)
+                folder = crm_files_folder_from_field_value(raw_folder, disk)
             except ValueError as exc:
                 total["skipped"] += 1
                 print(f"Event {event_id}: skip lead={lead_id} folder outside configured root {raw_folder!r}: {exc}")

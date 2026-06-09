@@ -393,7 +393,7 @@ def process_event_task(event: dict[str, Any], args: argparse.Namespace, amo: syn
             store.save_event(event)
         return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} empty folder"}
     try:
-        folder = sync.crm_files_folder_in_configured_root(raw_folder)
+        folder = sync.crm_files_folder_from_field_value(raw_folder, disk)
     except ValueError as exc:
         if not args.dry_run:
             store.save_event(event)
