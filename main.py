@@ -374,7 +374,15 @@ def process_event_task(event: dict[str, Any], args: argparse.Namespace, amo: syn
     lead_id = int(event.get("entity_id") or 0)
     if not lead_id:
         return {"uploaded": 0, "skipped": 1, "errors": 0, "label": "event without lead"}
-    lead = amo.get_lead(lead_id)
+    try:
+        lead = amo.get_lead(lead_id)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else 0
+        if status in {400, 404}:
+            if not args.dry_run:
+                store.save_event(event)
+            return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} unavailable status={status}"}
+        raise
     if int(lead.get("pipeline_id") or 0) not in allowed:
         if not args.dry_run:
             store.save_event(event)

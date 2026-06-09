@@ -1100,7 +1100,17 @@ def sync_field_events_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
             continue
 
         try:
-            lead = amo.get_lead(lead_id)
+            try:
+                lead = amo.get_lead(lead_id)
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                if status in {400, 404}:
+                    total["skipped"] += 1
+                    print(f"Event {event_id}: skip unavailable lead={lead_id} status={status}")
+                    if not args.dry_run:
+                        store.save_event(event)
+                    continue
+                raise
             pipeline_id = int(lead.get("pipeline_id") or 0)
             if pipeline_id not in allowed:
                 total["skipped"] += 1
@@ -1238,7 +1248,7 @@ def find_lead_for_disk_folder(amo: AmoClient, folder_name: str, allowed: dict[in
         try:
             lead = amo.get_lead(candidate_id)
         except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 404:
+            if exc.response is not None and exc.response.status_code in {400, 404}:
                 continue
             raise
         if int(lead.get("pipeline_id") or 0) in allowed:
