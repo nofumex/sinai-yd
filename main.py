@@ -432,10 +432,21 @@ def process_disk_folder_task(task: dict[str, Any], args: argparse.Namespace, amo
             raise
     current_value = sync.lead_folder_value(lead, field_id)
     updated = 0
+    update_failed = ""
     if not current_value or sync.normalize_disk_path(current_value) != sync.normalize_disk_path(field_value):
         if not args.dry_run:
-            amo.update_lead_folder_field(lead_id, field_id, field_value)
-        updated = 1
+            try:
+                amo.update_lead_folder_field(lead_id, field_id, field_value)
+                updated = 1
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else 0
+                if status in {400, 403, 404}:
+                    update_failed = f" CRM field update failed status={status}"
+                    print(f"  skip CRM field update: lead={lead_id} status={status}")
+                else:
+                    raise
+        else:
+            updated = 1
     stats = sync.sync_lead(
         amo,
         disk,
@@ -449,7 +460,7 @@ def process_disk_folder_task(task: dict[str, Any], args: argparse.Namespace, amo
     )
     if not args.dry_run and stats["errors"] == 0:
         store.save_disk_folder(folder_path, lead_id, field_value)
-    return {"uploaded": stats["uploaded"], "skipped": stats["skipped"], "errors": stats["errors"], "updated": updated, "label": f"disk folder lead {lead_id}"}
+    return {"uploaded": stats["uploaded"], "skipped": stats["skipped"], "errors": stats["errors"], "updated": updated, "label": f"disk folder lead {lead_id}{update_failed}"}
 
 
 def run_monitor_cycle(

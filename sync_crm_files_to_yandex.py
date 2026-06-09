@@ -1212,9 +1212,16 @@ def scan_disk_folders_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
                 if args.dry_run:
                     print(f"Disk folder {folder_name!r}: would update lead={lead_id} field={field_value}")
                 else:
-                    amo.update_lead_folder_field(lead_id, field_id, field_value)
-                    print(f"Disk folder {folder_name!r}: updated lead={lead_id} Yandex folder field")
-                    total["updated"] += 1
+                    try:
+                        amo.update_lead_folder_field(lead_id, field_id, field_value)
+                        print(f"Disk folder {folder_name!r}: updated lead={lead_id} Yandex folder field")
+                        total["updated"] += 1
+                    except requests.HTTPError as exc:
+                        status = exc.response.status_code if exc.response is not None else 0
+                        if status in {400, 403, 404}:
+                            print(f"Disk folder {folder_name!r}: skip CRM field update lead={lead_id} status={status}")
+                        else:
+                            raise
 
             stats = sync_lead(
                 amo,
