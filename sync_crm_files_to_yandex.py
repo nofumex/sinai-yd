@@ -194,7 +194,20 @@ def crm_files_folder_in_configured_root(client_folder: str) -> str:
 
 def yandex_client_url(folder_path: str) -> str:
     path = normalize_disk_path(folder_path)
-    return "https://disk.yandex.ru/client/disk/" + quote(path, safe="/()_-.,")
+    return "https://disk.yandex.ru/client/disk/" + quote_readable_disk_path(path)
+
+
+def quote_readable_disk_path(path: str) -> str:
+    replacements = {
+        "%": "%25",
+        " ": "%20",
+        "#": "%23",
+        "?": "%3F",
+        "\r": "%0D",
+        "\n": "%0A",
+        "\t": "%09",
+    }
+    return "".join(replacements.get(char, char) for char in path)
 
 
 def guess_is_audio(file_name: str, mime_type: str | None) -> bool:
