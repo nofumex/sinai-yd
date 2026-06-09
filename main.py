@@ -301,7 +301,7 @@ def discover_disk_tasks(amo: sync.AmoClient, disk: sync.YandexDiskClient, store:
         if not lead:
             store.save_disk_folder_no_match(folder_path, folder_name, folder_modified)
             continue
-        tasks.append({"kind": "disk_folder", "folder_name": folder_name, "folder_path": folder_path, "lead_id": int(lead["id"])})
+        tasks.append({"kind": "disk_folder", "folder_name": folder_name, "folder_path": folder_path, "lead_id": int(lead["id"]), "lead": lead})
     trace_log(f"disk scan done folders={len(folders)} without_id={without_id} new={len(tasks)}")
     return tasks, len(folders)
 
@@ -418,8 +418,18 @@ def process_disk_folder_task(task: dict[str, Any], args: argparse.Namespace, amo
     field_id = amo.resolve_folder_field_id()
     lead_id = int(task["lead_id"])
     folder_path = str(task["folder_path"])
-    lead = amo.get_lead(lead_id)
     field_value = sync.yandex_client_url(folder_path)
+    lead = task.get("lead")
+    if not isinstance(lead, dict):
+        try:
+            lead = amo.get_lead(lead_id)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status in {400, 404}:
+                if not args.dry_run:
+                    store.save_disk_folder(folder_path, lead_id, field_value)
+                return {"uploaded": 0, "skipped": 1, "errors": 0, "updated": 0, "label": f"disk folder lead {lead_id} unavailable status={status}"}
+            raise
     current_value = sync.lead_folder_value(lead, field_id)
     updated = 0
     if not current_value or sync.normalize_disk_path(current_value) != sync.normalize_disk_path(field_value):
@@ -454,9 +464,8 @@ def run_monitor_cycle(
     trace_log(f"cycle {state.cycles} start dry_run={args.dry_run}")
 
     if pending_batch(store):
-        check.notes.append("Есть ожидающая подтверждения пачка, новые задачи не запускаются.")
-        state.last_check = check
-        return
+        clear_pending_batch(store)
+        trace_log(f"cycle {state.cycles} cleared old pending batch")
 
     event_tasks, event_seen, period = discover_event_tasks(args, amo, store)
     disk_tasks, disk_seen = discover_disk_tasks(amo, disk, store)
@@ -472,28 +481,9 @@ def run_monitor_cycle(
         trace_log(f"cycle {state.cycles} done no tasks event_seen={event_seen} disk_seen={disk_seen}")
         return
 
-    too_many_events = len(event_tasks) > 5
-    too_many_disk = len(disk_tasks) > 5
-    if too_many_events or too_many_disk:
-        first, rest = tasks[0], tasks[1:]
-        result = process_task_logged(first, args, amo, disk, store)
+    for task in tasks:
+        result = process_task_logged(task, args, amo, disk, store)
         apply_result(check, result)
-        batch = {
-            "created_at": now_str(),
-            "field_events": len(event_tasks),
-            "disk_folders": len(disk_tasks),
-            "done_first": task_public_links(first),
-            "tasks": rest,
-        }
-        save_pending_batch(store, batch)
-        check.notes.append(
-            f"Большая пачка: изменений поля {len(event_tasks)}, новых папок Диска {len(disk_tasks)}. "
-            f"Сделана 1 задача, остальные ждут подтверждения."
-        )
-    else:
-        for task in tasks:
-            result = process_task_logged(task, args, amo, disk, store)
-            apply_result(check, result)
 
     state.total_uploaded += check.uploaded
     state.total_errors += check.errors
@@ -566,8 +556,8 @@ def task_public_links(task: dict[str, Any]) -> dict[str, str]:
 
 def render_panel(state: AppState, store: sync.Store, args: argparse.Namespace, view: str = "monitor") -> tuple[str, list[list[dict[str, str]]]]:
     enabled = monitor_enabled(store)
-    pending = pending_batch(store)
-    pending_processing = store.get_setting(PENDING_PROCESSING_KEY)
+    pending = None
+    pending_processing = ""
     check = state.last_check
     status = "включен" if enabled else "выключен"
     text = [
