@@ -393,6 +393,10 @@ class ProgressReporter:
         self.update(force=True)
 
     def file_done(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "task_upload_plan":
+            self.check.total_files += int(event.get("files") or 0)
+            self.update(force=True)
+            return
         if event.get("type") != "file_done":
             return
         self.check.processed_files += 1
@@ -643,10 +647,8 @@ def run_monitor_cycle(
 
     check.total_tasks = len(tasks)
     state.last_check = check
-    total_files = prepare_tasks_for_progress(tasks, args, amo, disk, store)
-    check.total_files = total_files
     reporter = ProgressReporter(TelegramUI(store), store, args, state, check)
-    reporter.start(len(tasks), total_files)
+    reporter.start(len(tasks), 0)
     setattr(args, "progress_callback", reporter.file_done)
 
     for index, task in enumerate(tasks, start=1):
@@ -685,10 +687,8 @@ def process_pending_batch(args: argparse.Namespace, amo: sync.AmoClient, disk: s
     tasks = list(batch.get("tasks") or [])
     check.total_tasks = len(tasks)
     state.last_check = check
-    total_files = prepare_tasks_for_progress(tasks, args, amo, disk, store)
-    check.total_files = total_files
     reporter = ProgressReporter(TelegramUI(store), store, args, state, check)
-    reporter.start(len(tasks), total_files)
+    reporter.start(len(tasks), 0)
     setattr(args, "progress_callback", reporter.file_done)
     for index, task in enumerate(tasks, start=1):
         reporter.start_task(index, task)
@@ -778,7 +778,7 @@ def render_panel(state: AppState, store: sync.Store, args: argparse.Namespace, v
                 "",
                 "<b>Прогресс текущего прогона</b>",
                 f"Найдено сделок/задач: <b>{check.total_tasks}</b>",
-                f"Файлов к загрузке: <b>{check.total_files}</b>",
+                f"Файлов к загрузке обнаружено: <b>{check.total_files}</b>",
                 f"Загружено: <b>{check.processed_tasks}/{check.total_tasks}</b> сделок, <b>{check.processed_files}/{check.total_files}</b> файлов",
                 f"Скорость сейчас: <b>{speed:.2f}</b> файлов/сек",
                 f"Ориентировочно осталось: <b>{format_duration(eta) if speed > 0 else '-'}</b>",
