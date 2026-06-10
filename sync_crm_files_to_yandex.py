@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -86,6 +87,17 @@ def env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def safe_print(*values: Any, sep: str = " ", end: str = "\n", flush: bool = True) -> None:
+    text = sep.join(str(value) for value in values) + end
+    encoding = sys.stdout.encoding or "utf-8"
+    try:
+        sys.stdout.write(text)
+    except UnicodeEncodeError:
+        sys.stdout.write(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+    if flush:
+        sys.stdout.flush()
 
 
 def safe_name(value: str, max_len: int = 140) -> str:
@@ -843,6 +855,40 @@ class YandexDiskClient:
             upload_response.raise_for_status()
         upload_response.raise_for_status()
 
+    def upload_url(self, source_url: str, target_path: str, overwrite: bool = False) -> None:
+        response = self.request(
+            "POST",
+            "/resources/upload",
+            params={
+                "url": source_url,
+                "path": target_path,
+                "overwrite": str(overwrite).lower(),
+                "disable_redirects": "false",
+            },
+        )
+        if response.status_code == 409:
+            response.raise_for_status()
+        operation = response.json()
+        href = str(operation.get("href") or "")
+        if href:
+            self.wait_operation(href)
+
+    def wait_operation(self, href: str, timeout_seconds: int = 900) -> None:
+        started = time.time()
+        url = href if href.startswith("http") else f"https://cloud-api.yandex.net/v1/disk{href}"
+        while True:
+            response = self.session.get(url, timeout=60)
+            response.raise_for_status()
+            payload = response.json()
+            status = str(payload.get("status") or "").lower()
+            if status == "success":
+                return
+            if status == "failed":
+                raise RuntimeError(f"Yandex URL upload operation failed: {payload}")
+            if time.time() - started > timeout_seconds:
+                raise TimeoutError(f"Yandex URL upload operation timed out: {href}")
+            time.sleep(1)
+
 
 def lead_folder_value(lead: dict[str, Any], field_id: int) -> str:
     for field in lead.get("custom_fields_values") or []:
@@ -910,6 +956,25 @@ def upload_with_retry(disk: YandexDiskClient, local_path: Path, target_path: str
     raise last_error or RuntimeError(f"Failed to upload {target_path}")
 
 
+def remote_upload_enabled() -> bool:
+    return env("YANDEX_REMOTE_UPLOAD", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def remote_upload_fallback_enabled() -> bool:
+    return env("YANDEX_REMOTE_UPLOAD_FALLBACK", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def attachment_download_url(amo: AmoClient, item: Attachment) -> str:
+    if item.download_url:
+        return item.download_url
+    meta = amo.get_file_meta(item.file_uuid)
+    links = meta.get("_links") or {}
+    download_url = ((links.get("download_version") or {}).get("href")) or ((links.get("download") or {}).get("href"))
+    if not download_url:
+        raise RuntimeError(f"No download link for amoCRM file uuid={item.file_uuid}")
+    return str(download_url)
+
+
 def worker_amo_client() -> AmoClient:
     client = getattr(THREAD_LOCAL, "amo_client", None)
     if client is None:
@@ -926,11 +991,37 @@ def worker_disk_client() -> YandexDiskClient:
     return client
 
 
-def transfer_attachment_worker(item: Attachment, target_path: str, tmp_dir: Path) -> None:
+def transfer_attachment_worker(item: Attachment, target_path: str, tmp_dir: Path) -> dict[str, float | int]:
     local_path: Path | None = None
+    started = time.perf_counter()
+    if remote_upload_enabled():
+        try:
+            download_url = attachment_download_url(worker_amo_client(), item)
+            worker_disk_client().upload_url(download_url, target_path, overwrite=False)
+            return {
+                "bytes": int(item.size or 0),
+                "download_seconds": 0.0,
+                "upload_seconds": time.perf_counter() - started,
+                "remote": 1,
+            }
+        except requests.HTTPError:
+            raise
+        except Exception as exc:
+            if not remote_upload_fallback_enabled():
+                raise
+            safe_print(f"  remote upload fallback: source={item.source_kind}/{item.source_id} file={item.display_name} error={exc}")
+
     try:
         local_path = download_attachment(worker_amo_client(), item, tmp_dir)
+        downloaded_at = time.perf_counter()
+        size = local_path.stat().st_size if local_path.exists() else int(item.size or 0)
         upload_with_retry(worker_disk_client(), local_path, target_path)
+        uploaded_at = time.perf_counter()
+        return {
+            "bytes": int(size),
+            "download_seconds": downloaded_at - started,
+            "upload_seconds": uploaded_at - downloaded_at,
+        }
     finally:
         if local_path is not None:
             try:
@@ -953,8 +1044,8 @@ def sync_lead(
 ) -> dict[str, int]:
     lead_id = int(lead["id"])
     stats = {"attachments": 0, "uploaded": 0, "skipped": 0, "errors": 0}
-    print(f"Lead {lead_id}: {lead.get('name') or ''}")
-    print(f"  target: disk:/{folder}")
+    safe_print(f"Lead {lead_id}: {lead.get('name') or ''}")
+    safe_print(f"  target: disk:/{folder}")
 
     if not dry_run:
         disk.ensure_folder(folder)
@@ -962,12 +1053,16 @@ def sync_lead(
     attachments = amo.collect_attachments(lead, include_contact_notes=include_contact_notes)
     stats["attachments"] = len(attachments)
     if not attachments:
-        print("  no files")
+        safe_print("  no files")
         return stats
 
     workers = upload_workers if upload_workers is not None else env_int("UPLOAD_WORKERS", env_int("YANDEX_UPLOAD_WORKERS", 8))
     workers = max(1, min(int(workers or 1), 32))
     queue: list[tuple[Attachment, str]] = []
+
+    uploaded_bytes = 0
+    download_seconds = 0.0
+    upload_seconds = 0.0
 
     with tempfile.TemporaryDirectory(prefix="sinai-yd-") as tmp:
         tmp_dir = Path(tmp)
@@ -975,16 +1070,16 @@ def sync_lead(
             target_path = item_target_path(folder, item)
             if skip_audio and guess_is_audio(item.display_name, item.mime_type):
                 stats["skipped"] += 1
-                print(f"  skip audio: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                safe_print(f"  skip audio: source={item.source_kind}/{item.source_id} file={item.display_name}")
                 continue
             if not force and store.has_upload(item, target_path):
                 stats["skipped"] += 1
-                print(f"  skip already uploaded: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                safe_print(f"  skip already uploaded: source={item.source_kind}/{item.source_id} file={item.display_name}")
                 continue
 
             try:
                 if dry_run:
-                    print(f"  would upload: source={item.source_kind}/{item.source_id} file={item.display_name} -> {target_path}")
+                    safe_print(f"  would upload: source={item.source_kind}/{item.source_id} file={item.display_name} -> {target_path}")
                     stats["skipped"] += 1
                     continue
                 queue.append((item, target_path))
@@ -994,43 +1089,50 @@ def sync_lead(
                 if status == 409:
                     store.save_upload(item, target_path)
                     stats["skipped"] += 1
-                    print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                    safe_print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
                 else:
                     stats["errors"] += 1
-                    print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
+                    safe_print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
             except Exception as exc:
                 stats["errors"] += 1
-                print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
+                safe_print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
 
         if not queue:
             return stats
 
         active_workers = min(workers, len(queue))
-        print(f"  upload queue: {len(queue)} files, workers={active_workers}")
+        transfer_started = time.perf_counter()
+        safe_print(f"  upload queue: {len(queue)} files, workers={active_workers}")
         if active_workers == 1:
             for item, target_path in queue:
                 try:
-                    local_path = download_attachment(amo, item, tmp_dir)
-                    try:
-                        upload_with_retry(disk, local_path, target_path)
-                    finally:
-                        local_path.unlink(missing_ok=True)
+                    timing = transfer_attachment_worker(item, target_path, tmp_dir)
+                    uploaded_bytes += int(timing.get("bytes") or 0)
+                    download_seconds += float(timing.get("download_seconds") or 0)
+                    upload_seconds += float(timing.get("upload_seconds") or 0)
                     store.save_upload(item, target_path)
                     stats["uploaded"] += 1
-                    print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                    safe_print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name}")
                 except requests.HTTPError as exc:
                     status = exc.response.status_code if exc.response is not None else "?"
                     body = exc.response.text[:300] if exc.response is not None else ""
                     if status == 409:
                         store.save_upload(item, target_path)
                         stats["skipped"] += 1
-                        print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                        safe_print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
                     else:
                         stats["errors"] += 1
-                        print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
+                        safe_print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
                 except Exception as exc:
                     stats["errors"] += 1
-                    print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
+                    safe_print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
+            elapsed = max(time.perf_counter() - transfer_started, 0.001)
+            safe_print(
+                f"  transfer summary: uploaded={stats['uploaded']} "
+                f"mb={uploaded_bytes / 1024 / 1024:.1f} wall={elapsed:.1f}s "
+                f"rate={uploaded_bytes / 1024 / 1024 / elapsed:.2f} MB/s "
+                f"download_sum={download_seconds:.1f}s upload_sum={upload_seconds:.1f}s"
+            )
             return stats
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=active_workers) as executor:
@@ -1043,23 +1145,33 @@ def sync_lead(
                 item, target_path = future_to_task[future]
                 completed += 1
                 try:
-                    future.result()
+                    timing = future.result()
+                    uploaded_bytes += int(timing.get("bytes") or 0)
+                    download_seconds += float(timing.get("download_seconds") or 0)
+                    upload_seconds += float(timing.get("upload_seconds") or 0)
                     store.save_upload(item, target_path)
                     stats["uploaded"] += 1
-                    print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name} ({completed}/{len(queue)})")
+                    safe_print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name} ({completed}/{len(queue)})")
                 except requests.HTTPError as exc:
                     status = exc.response.status_code if exc.response is not None else "?"
                     body = exc.response.text[:300] if exc.response is not None else ""
                     if status == 409:
                         store.save_upload(item, target_path)
                         stats["skipped"] += 1
-                        print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                        safe_print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
                     else:
                         stats["errors"] += 1
-                        print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
+                        safe_print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
                 except Exception as exc:
                     stats["errors"] += 1
-                    print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
+                    safe_print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
+        elapsed = max(time.perf_counter() - transfer_started, 0.001)
+        safe_print(
+            f"  transfer summary: uploaded={stats['uploaded']} "
+            f"mb={uploaded_bytes / 1024 / 1024:.1f} wall={elapsed:.1f}s "
+            f"rate={uploaded_bytes / 1024 / 1024 / elapsed:.2f} MB/s "
+            f"download_sum={download_seconds:.1f}s upload_sum={upload_seconds:.1f}s"
+        )
 
     return stats
 
