@@ -79,6 +79,13 @@ def require_env(name: str) -> str:
     return value
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = env(name)
+    if not value:
+        return default
+    return value.lower() not in {"0", "false", "no", "off"}
+
+
 def env_int(name: str, default: int) -> int:
     value = env(name)
     if not value:
@@ -526,7 +533,7 @@ class AmoClient:
         return self.drive_url
 
     def get_file_meta(self, file_uuid: str) -> dict[str, Any]:
-        response = self.session.get(f"{self.account_drive_url()}/v1.0/files/{file_uuid}", timeout=60)
+        response = self.session.get(f"{self.account_drive_url()}/v1.0/files/{file_uuid}", timeout=env_int("AMO_FILE_META_TIMEOUT_SECONDS", 20))
         response.raise_for_status()
         return response.json()
 
@@ -717,8 +724,18 @@ class AmoClient:
             }
         )
 
-    def collect_attachments(self, lead: dict[str, Any], include_contact_notes: bool = True) -> list[Attachment]:
+    def collect_attachments(
+        self,
+        lead: dict[str, Any],
+        include_contact_notes: bool = True,
+        include_attachment_notes: bool | None = None,
+    ) -> list[Attachment]:
         lead_id = int(lead["id"])
+        include_attachment_notes = not env_bool("NO_ATTACHMENT_NOTES", False) if include_attachment_notes is None else include_attachment_notes
+        print(
+            f"  collect files start: lead={lead_id} "
+            f"contact_files={include_contact_notes} attachment_notes={include_attachment_notes}"
+        )
         sources: list[tuple[str, int]] = [("leads", lead_id)]
         if include_contact_notes:
             sources.extend(("contacts", contact_id) for contact_id in self.lead_contact_ids(lead))
@@ -727,7 +744,9 @@ class AmoClient:
         seen_files: set[tuple[str, str]] = set()
         for entity_type, entity_id in sources:
             source_kind = "lead_file" if entity_type == "leads" else "contact_file"
-            for file_ref in self.list_entity_files(entity_type, entity_id):
+            file_refs = self.list_entity_files(entity_type, entity_id)
+            print(f"  collect entity files: lead={lead_id} entity={entity_type}/{entity_id} refs={len(file_refs)}")
+            for index, file_ref in enumerate(file_refs, start=1):
                 try:
                     item = self.attachment_from_file_ref(lead_id, entity_type, entity_id, source_kind, file_ref)
                 except requests.RequestException as exc:
@@ -740,8 +759,13 @@ class AmoClient:
                     continue
                 seen_files.add(key)
                 items.append(item)
+                if index % 25 == 0:
+                    print(f"  collect entity progress: lead={lead_id} entity={entity_type}/{entity_id} {index}/{len(file_refs)}")
 
+            if not include_attachment_notes:
+                continue
             notes = self.list_attachment_notes(entity_type, entity_id)
+            print(f"  collect attachment notes: lead={lead_id} entity={entity_type}/{entity_id} notes={len(notes)}")
             for note in notes:
                 params = note.get("params") or {}
                 file_uuid = str(params.get("file_uuid") or "")
@@ -773,6 +797,7 @@ class AmoClient:
                     continue
                 items.append(item)
         items.sort(key=lambda item: (item.created_at, item.source_kind, item.source_id, item.display_name))
+        print(f"  collect files done: lead={lead_id} items={len(items)}")
         return items
 
 
@@ -1040,6 +1065,7 @@ def sync_lead(
     force: bool = False,
     dry_run: bool = False,
     include_contact_notes: bool = True,
+    include_attachment_notes: bool | None = None,
     skip_audio: bool = True,
     upload_workers: int | None = None,
     attachments: list[Attachment] | None = None,
@@ -1053,7 +1079,11 @@ def sync_lead(
     if not dry_run:
         disk.ensure_folder(folder)
 
-    attachments = attachments if attachments is not None else amo.collect_attachments(lead, include_contact_notes=include_contact_notes)
+    attachments = attachments if attachments is not None else amo.collect_attachments(
+        lead,
+        include_contact_notes=include_contact_notes,
+        include_attachment_notes=include_attachment_notes,
+    )
     stats["attachments"] = len(attachments)
     if not attachments:
         safe_print("  no files")
@@ -1225,6 +1255,7 @@ def command_test_last(args: argparse.Namespace) -> int:
             force=args.force,
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
+            include_attachment_notes=not getattr(args, "no_attachment_notes", False),
             skip_audio=not args.include_audio,
             upload_workers=args.upload_workers,
         )
@@ -1259,6 +1290,7 @@ def command_test_leads(args: argparse.Namespace) -> int:
             force=args.force,
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
+            include_attachment_notes=not getattr(args, "no_attachment_notes", False),
             skip_audio=not args.include_audio,
             upload_workers=args.upload_workers,
         )
@@ -1310,6 +1342,7 @@ def command_sync_field_leads(args: argparse.Namespace) -> int:
             force=args.force,
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
+            include_attachment_notes=not getattr(args, "no_attachment_notes", False),
             skip_audio=not args.include_audio,
             upload_workers=args.upload_workers,
         )
@@ -1352,6 +1385,7 @@ def command_sync_by_field(args: argparse.Namespace) -> int:
             force=args.force,
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
+            include_attachment_notes=not getattr(args, "no_attachment_notes", False),
             skip_audio=not args.include_audio,
             upload_workers=args.upload_workers,
         )
@@ -1446,6 +1480,7 @@ def sync_field_events_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
                 force=args.force,
                 dry_run=args.dry_run,
                 include_contact_notes=not args.no_contact_notes,
+                include_attachment_notes=not getattr(args, "no_attachment_notes", False),
                 skip_audio=not args.include_audio,
                 upload_workers=args.upload_workers,
             )
@@ -1535,6 +1570,7 @@ def scan_disk_folders_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
                 force=args.force,
                 dry_run=args.dry_run,
                 include_contact_notes=not args.no_contact_notes,
+                include_attachment_notes=not getattr(args, "no_attachment_notes", False),
                 skip_audio=not args.include_audio,
                 upload_workers=args.upload_workers,
             )
@@ -1606,6 +1642,12 @@ def main() -> int:
     common.add_argument("--force", action="store_true", help="Upload even if local state says the file was uploaded.")
     common.add_argument("--include-audio", action="store_true", help="Also upload audio files.")
     common.add_argument("--no-contact-notes", action="store_true", help="Do not inspect linked contact attachment notes.")
+    common.add_argument(
+        "--no-attachment-notes",
+        action="store_true",
+        default=env_bool("NO_ATTACHMENT_NOTES", False),
+        help="Do not inspect legacy attachment notes.",
+    )
     common.add_argument(
         "--upload-workers",
         type=int,

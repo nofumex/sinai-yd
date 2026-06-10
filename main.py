@@ -270,7 +270,8 @@ def base_worker_args(cli: argparse.Namespace) -> argparse.Namespace:
         dry_run=cli.dry_run,
         force=False,
         include_audio=False,
-        no_contact_notes=False,
+        no_contact_notes=sync.env_bool("NO_CONTACT_NOTES", False),
+        no_attachment_notes=sync.env_bool("NO_ATTACHMENT_NOTES", False),
         upload_workers=cli.upload_workers,
         since=None,
         lookback_hours=cli.lookback_hours,
@@ -466,7 +467,11 @@ def prepare_task_for_progress(
         else:
             return 0
 
-        attachments = amo.collect_attachments(task["_lead"], include_contact_notes=not args.no_contact_notes)
+        attachments = amo.collect_attachments(
+            task["_lead"],
+            include_contact_notes=not args.no_contact_notes,
+            include_attachment_notes=not getattr(args, "no_attachment_notes", False),
+        )
         task["_attachments"] = attachments
         return count_upload_candidates(attachments, str(task["_folder"]), args, store)
     except Exception as exc:
@@ -555,6 +560,7 @@ def process_event_task(task: dict[str, Any], args: argparse.Namespace, amo: sync
         force=args.force,
         dry_run=args.dry_run,
         include_contact_notes=not args.no_contact_notes,
+        include_attachment_notes=not getattr(args, "no_attachment_notes", False),
         skip_audio=not args.include_audio,
         upload_workers=args.upload_workers,
         attachments=attachments if isinstance(attachments, list) else None,
@@ -607,6 +613,7 @@ def process_disk_folder_task(task: dict[str, Any], args: argparse.Namespace, amo
         force=args.force,
         dry_run=args.dry_run,
         include_contact_notes=not args.no_contact_notes,
+        include_attachment_notes=not getattr(args, "no_attachment_notes", False),
         skip_audio=not args.include_audio,
         upload_workers=args.upload_workers,
         attachments=task.get("_attachments") if isinstance(task.get("_attachments"), list) else None,
