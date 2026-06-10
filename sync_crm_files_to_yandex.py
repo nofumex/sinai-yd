@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote, unquote, urlparse
 
 import requests
@@ -1041,6 +1041,8 @@ def sync_lead(
     include_contact_notes: bool = True,
     skip_audio: bool = True,
     upload_workers: int | None = None,
+    attachments: list[Attachment] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, int]:
     lead_id = int(lead["id"])
     stats = {"attachments": 0, "uploaded": 0, "skipped": 0, "errors": 0}
@@ -1050,7 +1052,7 @@ def sync_lead(
     if not dry_run:
         disk.ensure_folder(folder)
 
-    attachments = amo.collect_attachments(lead, include_contact_notes=include_contact_notes)
+    attachments = attachments if attachments is not None else amo.collect_attachments(lead, include_contact_notes=include_contact_notes)
     stats["attachments"] = len(attachments)
     if not attachments:
         safe_print("  no files")
@@ -1103,6 +1105,8 @@ def sync_lead(
         active_workers = min(workers, len(queue))
         transfer_started = time.perf_counter()
         safe_print(f"  upload queue: {len(queue)} files, workers={active_workers}")
+        if progress_callback:
+            progress_callback({"type": "task_upload_plan", "files": len(queue), "lead_id": lead_id})
         if active_workers == 1:
             for item, target_path in queue:
                 try:
@@ -1112,6 +1116,8 @@ def sync_lead(
                     upload_seconds += float(timing.get("upload_seconds") or 0)
                     store.save_upload(item, target_path)
                     stats["uploaded"] += 1
+                    if progress_callback:
+                        progress_callback({"type": "file_done", "status": "uploaded", "lead_id": lead_id, "file_name": item.display_name})
                     safe_print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name}")
                 except requests.HTTPError as exc:
                     status = exc.response.status_code if exc.response is not None else "?"
@@ -1119,12 +1125,18 @@ def sync_lead(
                     if status == 409:
                         store.save_upload(item, target_path)
                         stats["skipped"] += 1
+                        if progress_callback:
+                            progress_callback({"type": "file_done", "status": "exists", "lead_id": lead_id, "file_name": item.display_name})
                         safe_print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
                     else:
                         stats["errors"] += 1
+                        if progress_callback:
+                            progress_callback({"type": "file_done", "status": "error", "lead_id": lead_id, "file_name": item.display_name})
                         safe_print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
                 except Exception as exc:
                     stats["errors"] += 1
+                    if progress_callback:
+                        progress_callback({"type": "file_done", "status": "error", "lead_id": lead_id, "file_name": item.display_name})
                     safe_print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
             elapsed = max(time.perf_counter() - transfer_started, 0.001)
             safe_print(
@@ -1151,6 +1163,8 @@ def sync_lead(
                     upload_seconds += float(timing.get("upload_seconds") or 0)
                     store.save_upload(item, target_path)
                     stats["uploaded"] += 1
+                    if progress_callback:
+                        progress_callback({"type": "file_done", "status": "uploaded", "lead_id": lead_id, "file_name": item.display_name})
                     safe_print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name} ({completed}/{len(queue)})")
                 except requests.HTTPError as exc:
                     status = exc.response.status_code if exc.response is not None else "?"
@@ -1158,12 +1172,18 @@ def sync_lead(
                     if status == 409:
                         store.save_upload(item, target_path)
                         stats["skipped"] += 1
+                        if progress_callback:
+                            progress_callback({"type": "file_done", "status": "exists", "lead_id": lead_id, "file_name": item.display_name})
                         safe_print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
                     else:
                         stats["errors"] += 1
+                        if progress_callback:
+                            progress_callback({"type": "file_done", "status": "error", "lead_id": lead_id, "file_name": item.display_name})
                         safe_print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
                 except Exception as exc:
                     stats["errors"] += 1
+                    if progress_callback:
+                        progress_callback({"type": "file_done", "status": "error", "lead_id": lead_id, "file_name": item.display_name})
                     safe_print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
         elapsed = max(time.perf_counter() - transfer_started, 0.001)
         safe_print(

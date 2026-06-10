@@ -39,10 +39,15 @@ class LastCheck:
     field_events_new: int = 0
     disk_folders_seen: int = 0
     disk_folders_new: int = 0
+    total_tasks: int = 0
+    total_files: int = 0
+    processed_files: int = 0
     processed_tasks: int = 0
     uploaded: int = 0
     skipped: int = 0
     errors: int = 0
+    progress_started_at: float = 0.0
+    active_task: str = ""
     notes: list[str] = field(default_factory=list)
 
 
@@ -160,6 +165,17 @@ class TelegramUI:
 def html(value: Any) -> str:
     text = str(value)
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} ч {minutes:02d} мин {secs:02d} сек"
+    if minutes:
+        return f"{minutes} мин {secs:02d} сек"
+    return f"{secs} сек"
 
 
 def write_log(text: str) -> None:
@@ -315,7 +331,7 @@ def process_task(
     store: sync.Store,
 ) -> dict[str, int | str]:
     if task["kind"] == "event":
-        return process_event_task(task["event"], args, amo, disk, store)
+        return process_event_task(task, args, amo, disk, store)
     if task["kind"] == "disk_folder":
         return process_disk_folder_task(task, args, amo, disk, store)
     raise ValueError(f"Unknown task kind: {task.get('kind')}")
@@ -347,6 +363,126 @@ class TeeBuffer:
         return self.buffer.getvalue()
 
 
+class ProgressReporter:
+    def __init__(
+        self,
+        tg: TelegramUI,
+        store: sync.Store,
+        args: argparse.Namespace,
+        state: AppState,
+        check: LastCheck,
+        update_interval: float = 5.0,
+    ) -> None:
+        self.tg = tg
+        self.store = store
+        self.args = args
+        self.state = state
+        self.check = check
+        self.update_interval = update_interval
+        self.last_update = 0.0
+
+    def start(self, total_tasks: int, total_files: int) -> None:
+        self.check.total_tasks = total_tasks
+        self.check.total_files = total_files
+        self.check.processed_files = 0
+        self.check.progress_started_at = time.time()
+        self.update(force=True)
+
+    def start_task(self, index: int, task: dict[str, Any]) -> None:
+        self.check.active_task = f"{index}/{self.check.total_tasks} {task_log_label(task)}"
+        self.update(force=True)
+
+    def file_done(self, event: dict[str, Any]) -> None:
+        if event.get("type") != "file_done":
+            return
+        self.check.processed_files += 1
+        self.update()
+
+    def finish_task(self) -> None:
+        self.update(force=True)
+
+    def update(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self.last_update < self.update_interval:
+            return
+        self.last_update = now
+        panel_text, keyboard = render_panel(self.state, self.store, self.args, view="monitor")
+        self.tg.edit_panel(panel_text, keyboard)
+
+
+def count_upload_candidates(
+    attachments: list[sync.Attachment],
+    folder: str,
+    args: argparse.Namespace,
+    store: sync.Store,
+) -> int:
+    total = 0
+    for item in attachments:
+        if not args.include_audio and sync.guess_is_audio(item.display_name, item.mime_type):
+            continue
+        target_path = sync.item_target_path(folder, item)
+        if not args.force and store.has_upload(item, target_path):
+            continue
+        total += 1
+    return total
+
+
+def prepare_task_for_progress(
+    task: dict[str, Any],
+    args: argparse.Namespace,
+    amo: sync.AmoClient,
+    disk: sync.YandexDiskClient,
+    store: sync.Store,
+) -> int:
+    try:
+        if task.get("kind") == "event":
+            field_id = amo.resolve_folder_field_id()
+            allowed = amo.allowed_pipeline_ids()
+            event = task.get("event") or {}
+            lead_id = int(event.get("entity_id") or 0)
+            if not lead_id:
+                return 0
+            lead = amo.get_lead(lead_id)
+            task["_lead"] = lead
+            if int(lead.get("pipeline_id") or 0) not in allowed:
+                return 0
+            raw_folder = sync.lead_folder_value(lead, field_id) or sync.event_folder_value(event, field_id)
+            if not raw_folder:
+                return 0
+            folder = sync.crm_files_folder_from_field_value(raw_folder, disk)
+            task["_folder"] = folder
+        elif task.get("kind") == "disk_folder":
+            lead = task.get("lead")
+            if not isinstance(lead, dict):
+                lead = amo.get_lead(int(task["lead_id"]))
+                task["_lead"] = lead
+            folder = sync.crm_files_folder(str(task["folder_path"]))
+            task["_folder"] = folder
+        else:
+            return 0
+
+        attachments = amo.collect_attachments(task["_lead"], include_contact_notes=not args.no_contact_notes)
+        task["_attachments"] = attachments
+        return count_upload_candidates(attachments, str(task["_folder"]), args, store)
+    except Exception as exc:
+        task["_prepare_error"] = str(exc)
+        return 0
+
+
+def prepare_tasks_for_progress(
+    tasks: list[dict[str, Any]],
+    args: argparse.Namespace,
+    amo: sync.AmoClient,
+    disk: sync.YandexDiskClient,
+    store: sync.Store,
+) -> int:
+    total_files = 0
+    for index, task in enumerate(tasks, start=1):
+        trace_log(f"prepare task {index}/{len(tasks)} {task_log_label(task)}")
+        total_files += prepare_task_for_progress(task, args, amo, disk, store)
+    return total_files
+
+
 def process_task_logged(
     task: dict[str, Any],
     args: argparse.Namespace,
@@ -369,36 +505,42 @@ def process_task_logged(
     return result
 
 
-def process_event_task(event: dict[str, Any], args: argparse.Namespace, amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> dict[str, int | str]:
+def process_event_task(task: dict[str, Any], args: argparse.Namespace, amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> dict[str, int | str]:
+    event = task.get("event") or {}
     field_id = amo.resolve_folder_field_id()
     allowed = amo.allowed_pipeline_ids()
     lead_id = int(event.get("entity_id") or 0)
     if not lead_id:
         return {"uploaded": 0, "skipped": 1, "errors": 0, "label": "event without lead"}
-    try:
-        lead = amo.get_lead(lead_id)
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else 0
-        if status in {400, 404}:
-            if not args.dry_run:
-                store.save_event(event)
-            return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} unavailable status={status}"}
-        raise
+    lead = task.get("_lead")
+    if not isinstance(lead, dict):
+        try:
+            lead = amo.get_lead(lead_id)
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            if status in {400, 404}:
+                if not args.dry_run:
+                    store.save_event(event)
+                return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} unavailable status={status}"}
+            raise
     if int(lead.get("pipeline_id") or 0) not in allowed:
         if not args.dry_run:
             store.save_event(event)
         return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} skipped by pipeline"}
-    raw_folder = sync.lead_folder_value(lead, field_id) or sync.event_folder_value(event, field_id)
-    if not raw_folder:
-        if not args.dry_run:
-            store.save_event(event)
-        return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} empty folder"}
-    try:
-        folder = sync.crm_files_folder_from_field_value(raw_folder, disk)
-    except ValueError as exc:
-        if not args.dry_run:
-            store.save_event(event)
-        return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} skipped folder outside root: {exc}"}
+    folder = str(task.get("_folder") or "")
+    if not folder:
+        raw_folder = sync.lead_folder_value(lead, field_id) or sync.event_folder_value(event, field_id)
+        if not raw_folder:
+            if not args.dry_run:
+                store.save_event(event)
+            return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} empty folder"}
+        try:
+            folder = sync.crm_files_folder_from_field_value(raw_folder, disk)
+        except ValueError as exc:
+            if not args.dry_run:
+                store.save_event(event)
+            return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} skipped folder outside root: {exc}"}
+    attachments = task.get("_attachments")
     stats = sync.sync_lead(
         amo,
         disk,
@@ -410,6 +552,8 @@ def process_event_task(event: dict[str, Any], args: argparse.Namespace, amo: syn
         include_contact_notes=not args.no_contact_notes,
         skip_audio=not args.include_audio,
         upload_workers=args.upload_workers,
+        attachments=attachments if isinstance(attachments, list) else None,
+        progress_callback=getattr(args, "progress_callback", None),
     )
     if not args.dry_run and stats["errors"] == 0:
         store.save_event(event)
@@ -454,12 +598,14 @@ def process_disk_folder_task(task: dict[str, Any], args: argparse.Namespace, amo
         disk,
         store,
         lead,
-        sync.crm_files_folder(folder_path),
+        str(task.get("_folder") or sync.crm_files_folder(folder_path)),
         force=args.force,
         dry_run=args.dry_run,
         include_contact_notes=not args.no_contact_notes,
         skip_audio=not args.include_audio,
         upload_workers=args.upload_workers,
+        attachments=task.get("_attachments") if isinstance(task.get("_attachments"), list) else None,
+        progress_callback=getattr(args, "progress_callback", None),
     )
     if not args.dry_run and stats["errors"] == 0:
         store.save_disk_folder(folder_path, lead_id, field_value)
@@ -495,9 +641,22 @@ def run_monitor_cycle(
         trace_log(f"cycle {state.cycles} done no tasks event_seen={event_seen} disk_seen={disk_seen}")
         return
 
-    for task in tasks:
+    check.total_tasks = len(tasks)
+    state.last_check = check
+    total_files = prepare_tasks_for_progress(tasks, args, amo, disk, store)
+    check.total_files = total_files
+    reporter = ProgressReporter(TelegramUI(store), store, args, state, check)
+    reporter.start(len(tasks), total_files)
+    setattr(args, "progress_callback", reporter.file_done)
+
+    for index, task in enumerate(tasks, start=1):
+        reporter.start_task(index, task)
         result = process_task_logged(task, args, amo, disk, store)
         apply_result(check, result)
+        reporter.finish_task()
+
+    if hasattr(args, "progress_callback"):
+        delattr(args, "progress_callback")
 
     state.total_uploaded += check.uploaded
     state.total_errors += check.errors
@@ -523,9 +682,21 @@ def process_pending_batch(args: argparse.Namespace, amo: sync.AmoClient, disk: s
     if not batch:
         check.notes.append("Нет ожидающей пачки.")
         return check
-    for task in batch.get("tasks") or []:
+    tasks = list(batch.get("tasks") or [])
+    check.total_tasks = len(tasks)
+    state.last_check = check
+    total_files = prepare_tasks_for_progress(tasks, args, amo, disk, store)
+    check.total_files = total_files
+    reporter = ProgressReporter(TelegramUI(store), store, args, state, check)
+    reporter.start(len(tasks), total_files)
+    setattr(args, "progress_callback", reporter.file_done)
+    for index, task in enumerate(tasks, start=1):
+        reporter.start_task(index, task)
         result = process_task_logged(task, args, amo, disk, store)
         apply_result(check, result)
+        reporter.finish_task()
+    if hasattr(args, "progress_callback"):
+        delattr(args, "progress_callback")
     clear_pending_batch(store)
     state.total_uploaded += check.uploaded
     state.total_errors += check.errors
@@ -597,6 +768,24 @@ def render_panel(state: AppState, store: sync.Store, args: argparse.Namespace, v
         f"Файлов загружено: <b>{state.total_uploaded}</b>",
         f"Ошибок: <b>{state.total_errors}</b>",
     ]
+    if check.total_tasks or check.total_files:
+        elapsed = max(time.time() - check.progress_started_at, 0.001) if check.progress_started_at else 0.0
+        speed = check.processed_files / elapsed if elapsed else 0.0
+        remaining_files = max(check.total_files - check.processed_files, 0)
+        eta = remaining_files / speed if speed > 0 else 0.0
+        text.extend(
+            [
+                "",
+                "<b>Прогресс текущего прогона</b>",
+                f"Найдено сделок/задач: <b>{check.total_tasks}</b>",
+                f"Файлов к загрузке: <b>{check.total_files}</b>",
+                f"Загружено: <b>{check.processed_tasks}/{check.total_tasks}</b> сделок, <b>{check.processed_files}/{check.total_files}</b> файлов",
+                f"Скорость сейчас: <b>{speed:.2f}</b> файлов/сек",
+                f"Ориентировочно осталось: <b>{format_duration(eta) if speed > 0 else '-'}</b>",
+            ]
+        )
+        if check.active_task:
+            text.append(f"Текущая задача: {html(check.active_task)}")
     if pending:
         done = pending.get("done_first") or {}
         text.extend(
