@@ -769,7 +769,8 @@ class AmoClient:
                 try:
                     item = self.hydrate_attachment(item)
                 except requests.RequestException as exc:
-                    print(f"  file meta failed: lead={lead_id} note={note.get('id')} uuid={file_uuid} error={exc}")
+                    print(f"  skip missing note file: lead={lead_id} note={note.get('id')} uuid={file_uuid} error={exc}")
+                    continue
                 items.append(item)
         items.sort(key=lambda item: (item.created_at, item.source_kind, item.source_id, item.display_name))
         return items
@@ -1128,6 +1129,12 @@ def sync_lead(
                         if progress_callback:
                             progress_callback({"type": "file_done", "status": "exists", "lead_id": lead_id, "file_name": item.display_name})
                         safe_print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                    elif status == 404:
+                        store.save_upload(item, target_path)
+                        stats["skipped"] += 1
+                        if progress_callback:
+                            progress_callback({"type": "file_done", "status": "missing", "lead_id": lead_id, "file_name": item.display_name})
+                        safe_print(f"  skip missing source: source={item.source_kind}/{item.source_id} file={item.display_name}")
                     else:
                         stats["errors"] += 1
                         if progress_callback:
@@ -1175,6 +1182,12 @@ def sync_lead(
                         if progress_callback:
                             progress_callback({"type": "file_done", "status": "exists", "lead_id": lead_id, "file_name": item.display_name})
                         safe_print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                    elif status == 404:
+                        store.save_upload(item, target_path)
+                        stats["skipped"] += 1
+                        if progress_callback:
+                            progress_callback({"type": "file_done", "status": "missing", "lead_id": lead_id, "file_name": item.display_name})
+                        safe_print(f"  skip missing source: source={item.source_kind}/{item.source_id} file={item.display_name}")
                     else:
                         stats["errors"] += 1
                         if progress_callback:
