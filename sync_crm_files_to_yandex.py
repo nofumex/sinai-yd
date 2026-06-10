@@ -91,7 +91,7 @@ def env_int(name: str, default: int) -> int:
 
 def safe_print(*values: Any, sep: str = " ", end: str = "\n", flush: bool = True) -> None:
     text = sep.join(str(value) for value in values) + end
-    encoding = sys.stdout.encoding or "utf-8"
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
     try:
         sys.stdout.write(text)
     except UnicodeEncodeError:

@@ -349,6 +349,7 @@ def task_log_label(task: dict[str, Any]) -> str:
 class TeeBuffer:
     def __init__(self) -> None:
         self.buffer = io.StringIO()
+        self.encoding = getattr(sys.__stdout__, "encoding", None) or "utf-8"
 
     def write(self, text: str) -> int:
         self.buffer.write(text)
