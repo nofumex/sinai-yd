@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import mimetypes
 import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,6 +64,7 @@ def load_env() -> dict[str, str]:
 
 
 ENV = load_env()
+THREAD_LOCAL = threading.local()
 
 
 def env(name: str, default: str = "") -> str:
@@ -73,6 +76,16 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
     return value
+
+
+def env_int(name: str, default: int) -> int:
+    value = env(name)
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def safe_name(value: str, max_len: int = 140) -> str:
@@ -865,7 +878,8 @@ def download_attachment(amo: AmoClient, item: Attachment, tmp_dir: Path) -> Path
     if not download_url:
         raise RuntimeError(f"No download link for amoCRM file uuid={item.file_uuid}")
 
-    out_path = tmp_dir / safe_name(item.display_name)
+    out_name = safe_name(f"{item.file_uuid}_{item.version_uuid or item.source_id}_{item.display_name}", max_len=180)
+    out_path = tmp_dir / out_name
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
@@ -896,6 +910,35 @@ def upload_with_retry(disk: YandexDiskClient, local_path: Path, target_path: str
     raise last_error or RuntimeError(f"Failed to upload {target_path}")
 
 
+def worker_amo_client() -> AmoClient:
+    client = getattr(THREAD_LOCAL, "amo_client", None)
+    if client is None:
+        client = AmoClient()
+        THREAD_LOCAL.amo_client = client
+    return client
+
+
+def worker_disk_client() -> YandexDiskClient:
+    client = getattr(THREAD_LOCAL, "disk_client", None)
+    if client is None:
+        client = YandexDiskClient()
+        THREAD_LOCAL.disk_client = client
+    return client
+
+
+def transfer_attachment_worker(item: Attachment, target_path: str, tmp_dir: Path) -> None:
+    local_path: Path | None = None
+    try:
+        local_path = download_attachment(worker_amo_client(), item, tmp_dir)
+        upload_with_retry(worker_disk_client(), local_path, target_path)
+    finally:
+        if local_path is not None:
+            try:
+                local_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def sync_lead(
     amo: AmoClient,
     disk: YandexDiskClient,
@@ -906,6 +949,7 @@ def sync_lead(
     dry_run: bool = False,
     include_contact_notes: bool = True,
     skip_audio: bool = True,
+    upload_workers: int | None = None,
 ) -> dict[str, int]:
     lead_id = int(lead["id"])
     stats = {"attachments": 0, "uploaded": 0, "skipped": 0, "errors": 0}
@@ -920,6 +964,10 @@ def sync_lead(
     if not attachments:
         print("  no files")
         return stats
+
+    workers = upload_workers if upload_workers is not None else env_int("UPLOAD_WORKERS", env_int("YANDEX_UPLOAD_WORKERS", 8))
+    workers = max(1, min(int(workers or 1), 32))
+    queue: list[tuple[Attachment, str]] = []
 
     with tempfile.TemporaryDirectory(prefix="sinai-yd-") as tmp:
         tmp_dir = Path(tmp)
@@ -939,11 +987,7 @@ def sync_lead(
                     print(f"  would upload: source={item.source_kind}/{item.source_id} file={item.display_name} -> {target_path}")
                     stats["skipped"] += 1
                     continue
-                local_path = download_attachment(amo, item, tmp_dir)
-                upload_with_retry(disk, local_path, target_path)
-                store.save_upload(item, target_path)
-                stats["uploaded"] += 1
-                print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                queue.append((item, target_path))
             except requests.HTTPError as exc:
                 status = exc.response.status_code if exc.response is not None else "?"
                 body = exc.response.text[:300] if exc.response is not None else ""
@@ -957,6 +1001,65 @@ def sync_lead(
             except Exception as exc:
                 stats["errors"] += 1
                 print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
+
+        if not queue:
+            return stats
+
+        active_workers = min(workers, len(queue))
+        print(f"  upload queue: {len(queue)} files, workers={active_workers}")
+        if active_workers == 1:
+            for item, target_path in queue:
+                try:
+                    local_path = download_attachment(amo, item, tmp_dir)
+                    try:
+                        upload_with_retry(disk, local_path, target_path)
+                    finally:
+                        local_path.unlink(missing_ok=True)
+                    store.save_upload(item, target_path)
+                    stats["uploaded"] += 1
+                    print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else "?"
+                    body = exc.response.text[:300] if exc.response is not None else ""
+                    if status == 409:
+                        store.save_upload(item, target_path)
+                        stats["skipped"] += 1
+                        print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                    else:
+                        stats["errors"] += 1
+                        print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
+                except Exception as exc:
+                    stats["errors"] += 1
+                    print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
+            return stats
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=active_workers) as executor:
+            future_to_task = {
+                executor.submit(transfer_attachment_worker, item, target_path, tmp_dir): (item, target_path)
+                for item, target_path in queue
+            }
+            completed = 0
+            for future in concurrent.futures.as_completed(future_to_task):
+                item, target_path = future_to_task[future]
+                completed += 1
+                try:
+                    future.result()
+                    store.save_upload(item, target_path)
+                    stats["uploaded"] += 1
+                    print(f"  uploaded: source={item.source_kind}/{item.source_id} file={item.display_name} ({completed}/{len(queue)})")
+                except requests.HTTPError as exc:
+                    status = exc.response.status_code if exc.response is not None else "?"
+                    body = exc.response.text[:300] if exc.response is not None else ""
+                    if status == 409:
+                        store.save_upload(item, target_path)
+                        stats["skipped"] += 1
+                        print(f"  skip exists on disk: source={item.source_kind}/{item.source_id} file={item.display_name}")
+                    else:
+                        stats["errors"] += 1
+                        print(f"  error http={status}: source={item.source_kind}/{item.source_id} file={item.display_name} {body}")
+                except Exception as exc:
+                    stats["errors"] += 1
+                    print(f"  error: source={item.source_kind}/{item.source_id} file={item.display_name} {exc}")
 
     return stats
 
@@ -978,6 +1081,7 @@ def command_test_last(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
             skip_audio=not args.include_audio,
+            upload_workers=args.upload_workers,
         )
         for key, value in stats.items():
             total[key] += value
@@ -1011,6 +1115,7 @@ def command_test_leads(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
             skip_audio=not args.include_audio,
+            upload_workers=args.upload_workers,
         )
         for key, value in stats.items():
             total[key] += value
@@ -1061,6 +1166,7 @@ def command_sync_field_leads(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
             skip_audio=not args.include_audio,
+            upload_workers=args.upload_workers,
         )
         for key, value in stats.items():
             total[key] += value
@@ -1102,6 +1208,7 @@ def command_sync_by_field(args: argparse.Namespace) -> int:
             dry_run=args.dry_run,
             include_contact_notes=not args.no_contact_notes,
             skip_audio=not args.include_audio,
+            upload_workers=args.upload_workers,
         )
         for key, value in stats.items():
             total[key] += value
@@ -1195,6 +1302,7 @@ def sync_field_events_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
                 dry_run=args.dry_run,
                 include_contact_notes=not args.no_contact_notes,
                 skip_audio=not args.include_audio,
+                upload_workers=args.upload_workers,
             )
             for key, value in stats.items():
                 total[key] += value
@@ -1283,6 +1391,7 @@ def scan_disk_folders_once(args: argparse.Namespace, amo: AmoClient, disk: Yande
                 dry_run=args.dry_run,
                 include_contact_notes=not args.no_contact_notes,
                 skip_audio=not args.include_audio,
+                upload_workers=args.upload_workers,
             )
             for key in ("attachments", "uploaded", "skipped", "errors"):
                 total[key] += stats[key]
@@ -1352,6 +1461,12 @@ def main() -> int:
     common.add_argument("--force", action="store_true", help="Upload even if local state says the file was uploaded.")
     common.add_argument("--include-audio", action="store_true", help="Also upload audio files.")
     common.add_argument("--no-contact-notes", action="store_true", help="Do not inspect linked contact attachment notes.")
+    common.add_argument(
+        "--upload-workers",
+        type=int,
+        default=env_int("UPLOAD_WORKERS", env_int("YANDEX_UPLOAD_WORKERS", 8)),
+        help="Parallel file transfers per lead. Use 8-16 normally; too high can trigger API throttling.",
+    )
 
     test_last = subparsers.add_parser("test-last", parents=[common], help="Upload attachments from latest CRM leads to test folders.")
     test_last.add_argument("--limit", type=int, default=3)

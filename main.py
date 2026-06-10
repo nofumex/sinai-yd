@@ -255,6 +255,7 @@ def base_worker_args(cli: argparse.Namespace) -> argparse.Namespace:
         force=False,
         include_audio=False,
         no_contact_notes=False,
+        upload_workers=cli.upload_workers,
         since=None,
         lookback_hours=cli.lookback_hours,
         interval_seconds=cli.interval_seconds,
@@ -408,6 +409,7 @@ def process_event_task(event: dict[str, Any], args: argparse.Namespace, amo: syn
         dry_run=args.dry_run,
         include_contact_notes=not args.no_contact_notes,
         skip_audio=not args.include_audio,
+        upload_workers=args.upload_workers,
     )
     if not args.dry_run and stats["errors"] == 0:
         store.save_event(event)
@@ -457,6 +459,7 @@ def process_disk_folder_task(task: dict[str, Any], args: argparse.Namespace, amo
         dry_run=args.dry_run,
         include_contact_notes=not args.no_contact_notes,
         skip_audio=not args.include_audio,
+        upload_workers=args.upload_workers,
     )
     if not args.dry_run and stats["errors"] == 0:
         store.save_disk_folder(folder_path, lead_id, field_value)
@@ -700,6 +703,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run amoCRM -> Yandex Disk monitor.")
     parser.add_argument("--interval-seconds", type=int, default=int(sync.env("MONITOR_INTERVAL_SECONDS", "300")))
     parser.add_argument("--lookback-hours", type=float, default=float(sync.env("EVENT_LOOKBACK_HOURS", "24")))
+    parser.add_argument("--upload-workers", type=int, default=sync.env_int("UPLOAD_WORKERS", sync.env_int("YANDEX_UPLOAD_WORKERS", 8)))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--reset-panel", action="store_true", help="Delete the known panel message and create a fresh one.")
