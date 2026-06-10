@@ -672,6 +672,18 @@ class AmoClient:
     def list_entity_files(self, entity_type: str, entity_id: int) -> list[dict[str, Any]]:
         return self.list_embedded(f"/api/v4/{entity_type}/{entity_id}/files", "files", {"limit": 250})
 
+    def list_entity_files_with_hard_timeout(self, entity_type: str, entity_id: int, label: str) -> list[dict[str, Any]] | None:
+        timeout = env_int("AMO_FILE_LIST_HARD_TIMEOUT_SECONDS", 30)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(lambda: AmoClient().list_entity_files(entity_type, entity_id))
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            print(f"  collect entity files hard-timeout: {label} timeout={timeout}s")
+            return None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
     def attachment_from_file_ref(
         self,
         lead_id: int,
@@ -744,11 +756,14 @@ class AmoClient:
         seen_files: set[tuple[str, str]] = set()
         for entity_type, entity_id in sources:
             source_kind = "lead_file" if entity_type == "leads" else "contact_file"
-            print(f"  collect entity files request: lead={lead_id} entity={entity_type}/{entity_id}")
+            label = f"lead={lead_id} entity={entity_type}/{entity_id}"
+            print(f"  collect entity files request: {label}")
             try:
-                file_refs = self.list_entity_files(entity_type, entity_id)
+                file_refs = self.list_entity_files_with_hard_timeout(entity_type, entity_id, label)
             except requests.RequestException as exc:
                 print(f"  collect entity files failed: lead={lead_id} entity={entity_type}/{entity_id} error={exc}")
+                continue
+            if file_refs is None:
                 continue
             print(f"  collect entity files: lead={lead_id} entity={entity_type}/{entity_id} refs={len(file_refs)}")
             for index, file_ref in enumerate(file_refs, start=1):
