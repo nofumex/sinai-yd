@@ -39,6 +39,8 @@ class LastCheck:
     field_events_new: int = 0
     disk_folders_seen: int = 0
     disk_folders_new: int = 0
+    updated_leads_seen: int = 0
+    updated_leads_new: int = 0
     total_tasks: int = 0
     total_files: int = 0
     processed_files: int = 0
@@ -324,6 +326,43 @@ def discover_disk_tasks(amo: sync.AmoClient, disk: sync.YandexDiskClient, store:
     return tasks, len(folders)
 
 
+def discover_updated_lead_tasks(args: argparse.Namespace, amo: sync.AmoClient, store: sync.Store) -> tuple[list[dict[str, Any]], int, int]:
+    if not sync.env_bool("SYNC_UPDATED_CONNECTED_LEADS", True):
+        return [], 0, 0
+    field_id = amo.resolve_folder_field_id()
+    now = int(time.time())
+    setting_key = f"last_connected_lead_updated_at_field_{field_id}"
+    saved_ts = store.get_setting_int(setting_key, 0)
+    fallback_hours = float(sync.env("UPDATED_LEADS_LOOKBACK_HOURS", str(args.lookback_hours)))
+    fallback = now - int(fallback_hours * 3600)
+    from_ts = max(0, saved_ts - 60) if saved_ts else fallback
+    limit = sync.env_int("UPDATED_LEADS_SCAN_LIMIT", 250)
+    trace_log(f"updated leads scan start field_id={field_id} from={fmt_time(from_ts)} limit={limit}")
+    leads, max_updated_at = amo.iter_leads_with_folder_field(field_id, since_updated_at=from_ts, limit=limit)
+    tasks = [{"kind": "updated_lead", "lead": lead, "lead_id": int(lead["id"])} for lead in leads]
+    trace_log(f"updated leads scan done seen={len(leads)} new={len(tasks)} max_updated_at={fmt_time(max_updated_at)}")
+    return tasks, len(leads), max_updated_at
+
+
+def task_lead_id(task: dict[str, Any]) -> int:
+    if task.get("kind") == "event":
+        return int((task.get("event") or {}).get("entity_id") or 0)
+    return int(task.get("lead_id") or 0)
+
+
+def dedupe_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for task in tasks:
+        lead_id = task_lead_id(task)
+        key = ("lead", lead_id) if lead_id else ("task", id(task))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(task)
+    return result
+
+
 def process_task(
     task: dict[str, Any],
     args: argparse.Namespace,
@@ -335,6 +374,8 @@ def process_task(
         return process_event_task(task, args, amo, disk, store)
     if task["kind"] == "disk_folder":
         return process_disk_folder_task(task, args, amo, disk, store)
+    if task["kind"] == "updated_lead":
+        return process_updated_lead_task(task, args, amo, disk, store)
     raise ValueError(f"Unknown task kind: {task.get('kind')}")
 
 
@@ -344,6 +385,8 @@ def task_log_label(task: dict[str, Any]) -> str:
         return f"field event lead={int(event.get('entity_id') or 0)} event={event.get('id') or ''}"
     if task.get("kind") == "disk_folder":
         return f"disk folder lead={int(task.get('lead_id') or 0)} folder={task.get('folder_name') or ''}"
+    if task.get("kind") == "updated_lead":
+        return f"updated lead={int(task.get('lead_id') or 0)}"
     return str(task.get("kind") or "task")
 
 
@@ -624,6 +667,36 @@ def process_disk_folder_task(task: dict[str, Any], args: argparse.Namespace, amo
     return {"uploaded": stats["uploaded"], "skipped": stats["skipped"], "errors": stats["errors"], "updated": updated, "label": f"disk folder lead {lead_id}{update_failed}"}
 
 
+def process_updated_lead_task(task: dict[str, Any], args: argparse.Namespace, amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> dict[str, int | str]:
+    field_id = amo.resolve_folder_field_id()
+    lead = task.get("lead")
+    lead_id = int(task.get("lead_id") or 0)
+    if not isinstance(lead, dict):
+        lead = amo.get_lead(lead_id)
+    raw_folder = sync.lead_folder_value(lead, field_id)
+    if not raw_folder:
+        return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"updated lead {lead_id} empty folder"}
+    try:
+        folder = sync.crm_files_folder_from_field_value(raw_folder, disk)
+    except ValueError as exc:
+        return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"updated lead {lead_id} skipped folder outside root: {exc}"}
+    stats = sync.sync_lead(
+        amo,
+        disk,
+        store,
+        lead,
+        folder,
+        force=args.force,
+        dry_run=args.dry_run,
+        include_contact_notes=not args.no_contact_notes,
+        include_attachment_notes=not getattr(args, "no_attachment_notes", False),
+        skip_audio=not args.include_audio,
+        upload_workers=args.upload_workers,
+        progress_callback=getattr(args, "progress_callback", None),
+    )
+    return {"uploaded": stats["uploaded"], "skipped": stats["skipped"], "errors": stats["errors"], "label": f"updated lead {lead_id}"}
+
+
 def run_monitor_cycle(
     args: argparse.Namespace,
     amo: sync.AmoClient,
@@ -641,13 +714,16 @@ def run_monitor_cycle(
 
     event_tasks, event_seen, period = discover_event_tasks(args, amo, store)
     disk_tasks, disk_seen = discover_disk_tasks(amo, disk, store)
+    updated_tasks, updated_seen, max_updated_at = discover_updated_lead_tasks(args, amo, store)
     check.period = period
     check.field_events_seen = event_seen
     check.field_events_new = len(event_tasks)
     check.disk_folders_seen = disk_seen
     check.disk_folders_new = len(disk_tasks)
+    check.updated_leads_seen = updated_seen
+    check.updated_leads_new = len(updated_tasks)
 
-    tasks = event_tasks + disk_tasks
+    tasks = dedupe_tasks(event_tasks + disk_tasks + updated_tasks)
     if not tasks:
         state.last_check = check
         trace_log(f"cycle {state.cycles} done no tasks event_seen={event_seen} disk_seen={disk_seen}")
@@ -667,6 +743,10 @@ def run_monitor_cycle(
 
     if hasattr(args, "progress_callback"):
         delattr(args, "progress_callback")
+
+    if not args.dry_run and max_updated_at:
+        field_id = amo.resolve_folder_field_id()
+        store.set_setting_int(f"last_connected_lead_updated_at_field_{field_id}", max_updated_at)
 
     state.total_uploaded += check.uploaded
     state.total_errors += check.errors
@@ -766,6 +846,8 @@ def render_panel(state: AppState, store: sync.Store, args: argparse.Namespace, v
         f"Новых событий поля: <b>{check.field_events_new}</b>",
         f"Папок на Диске просмотрено: <b>{check.disk_folders_seen}</b>",
         f"Новых папок к обработке: <b>{check.disk_folders_new}</b>",
+        f"Подключённых сделок обновлено: <b>{check.updated_leads_seen}</b>",
+        f"Подключённых сделок к проверке: <b>{check.updated_leads_new}</b>",
         f"Задач обработано: <b>{check.processed_tasks}</b>",
         f"Файлов загружено: <b>{check.uploaded}</b>",
         f"Пропущено/уже было: <b>{check.skipped}</b>",
