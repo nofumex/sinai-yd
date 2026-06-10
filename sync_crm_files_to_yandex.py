@@ -498,14 +498,14 @@ class AmoClient:
         self.drive_url: str | None = None
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self.session.get(f"{self.base_url}{path}", params=params, timeout=60)
+        response = self.session.get(f"{self.base_url}{path}", params=params, timeout=env_int("AMO_API_TIMEOUT_SECONDS", 20))
         if response.status_code == 204:
             return {}
         response.raise_for_status()
         return response.json()
 
     def patch(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.session.patch(f"{self.base_url}{path}", json=payload, timeout=60)
+        response = self.session.patch(f"{self.base_url}{path}", json=payload, timeout=env_int("AMO_API_TIMEOUT_SECONDS", 20))
         if response.status_code == 204:
             return {}
         response.raise_for_status()
@@ -744,7 +744,12 @@ class AmoClient:
         seen_files: set[tuple[str, str]] = set()
         for entity_type, entity_id in sources:
             source_kind = "lead_file" if entity_type == "leads" else "contact_file"
-            file_refs = self.list_entity_files(entity_type, entity_id)
+            print(f"  collect entity files request: lead={lead_id} entity={entity_type}/{entity_id}")
+            try:
+                file_refs = self.list_entity_files(entity_type, entity_id)
+            except requests.RequestException as exc:
+                print(f"  collect entity files failed: lead={lead_id} entity={entity_type}/{entity_id} error={exc}")
+                continue
             print(f"  collect entity files: lead={lead_id} entity={entity_type}/{entity_id} refs={len(file_refs)}")
             for index, file_ref in enumerate(file_refs, start=1):
                 try:
