@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import gc
 import io
 import json
 import os
@@ -296,7 +297,14 @@ def discover_event_tasks(args: argparse.Namespace, amo: sync.AmoClient, store: s
     return tasks, len(events), period
 
 
-def discover_disk_tasks(amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> tuple[list[dict[str, Any]], int]:
+def discover_disk_tasks(args: argparse.Namespace, amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> tuple[list[dict[str, Any]], int]:
+    interval = sync.env_int("YANDEX_DISK_SCAN_INTERVAL_SECONDS", 300)
+    now = int(time.time())
+    last_scan = store.get_setting_int("last_disk_scan_at", 0)
+    if interval > 0 and last_scan and now - last_scan < interval:
+        trace_log(f"disk scan skipped interval={interval}s last={fmt_time(last_scan)}")
+        return [], 0
+
     allowed = amo.allowed_pipeline_ids()
     root = sync.normalize_disk_path(sync.env("YANDEX_DISK_SCAN_ROOT", sync.env("YANDEX_DISK_TEST_ROOT", "test-CRM")))
     trace_log(f"disk scan start root=disk:/{root}")
@@ -322,6 +330,8 @@ def discover_disk_tasks(amo: sync.AmoClient, disk: sync.YandexDiskClient, store:
             store.save_disk_folder_no_match(folder_path, folder_name, folder_modified)
             continue
         tasks.append({"kind": "disk_folder", "folder_name": folder_name, "folder_path": folder_path, "lead_id": int(lead["id"]), "lead": lead})
+    if not args.dry_run:
+        store.set_setting_int("last_disk_scan_at", now)
     trace_log(f"disk scan done folders={len(folders)} without_id={without_id} new={len(tasks)}")
     return tasks, len(folders)
 
@@ -361,6 +371,13 @@ def dedupe_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen.add(key)
         result.append(task)
     return result
+
+
+def save_updated_leads_cursor(args: argparse.Namespace, amo: sync.AmoClient, store: sync.Store, max_updated_at: int) -> None:
+    if args.dry_run or not max_updated_at:
+        return
+    field_id = amo.resolve_folder_field_id()
+    store.set_setting_int(f"last_connected_lead_updated_at_field_{field_id}", max_updated_at)
 
 
 def process_task(
@@ -713,7 +730,7 @@ def run_monitor_cycle(
         trace_log(f"cycle {state.cycles} cleared old pending batch")
 
     event_tasks, event_seen, period = discover_event_tasks(args, amo, store)
-    disk_tasks, disk_seen = discover_disk_tasks(amo, disk, store)
+    disk_tasks, disk_seen = discover_disk_tasks(args, amo, disk, store)
     updated_tasks, updated_seen, max_updated_at = discover_updated_lead_tasks(args, amo, store)
     check.period = period
     check.field_events_seen = event_seen
@@ -725,8 +742,10 @@ def run_monitor_cycle(
 
     tasks = dedupe_tasks(event_tasks + disk_tasks + updated_tasks)
     if not tasks:
+        save_updated_leads_cursor(args, amo, store, max_updated_at)
         state.last_check = check
         trace_log(f"cycle {state.cycles} done no tasks event_seen={event_seen} disk_seen={disk_seen}")
+        gc.collect()
         return
 
     check.total_tasks = len(tasks)
@@ -744,9 +763,7 @@ def run_monitor_cycle(
     if hasattr(args, "progress_callback"):
         delattr(args, "progress_callback")
 
-    if not args.dry_run and max_updated_at:
-        field_id = amo.resolve_folder_field_id()
-        store.set_setting_int(f"last_connected_lead_updated_at_field_{field_id}", max_updated_at)
+    save_updated_leads_cursor(args, amo, store, max_updated_at)
 
     state.total_uploaded += check.uploaded
     state.total_errors += check.errors
@@ -754,6 +771,7 @@ def run_monitor_cycle(
         state.last_error = "; ".join(check.notes[-3:]) or "Есть ошибки в последнем цикле"
     state.last_check = check
     trace_log(f"cycle {state.cycles} done tasks={check.processed_tasks} uploaded={check.uploaded} skipped={check.skipped} errors={check.errors}")
+    gc.collect()
 
 
 def apply_result(check: LastCheck, result: dict[str, int | str]) -> None:
