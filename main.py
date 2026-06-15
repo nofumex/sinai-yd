@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import concurrent.futures
 import contextlib
+import ctypes
 import gc
 import io
 import json
@@ -209,6 +211,30 @@ def sanitize_log_text(text: str) -> str:
     return text
 
 
+def process_memory_mb() -> int:
+    status_path = Path("/proc/self/status")
+    if not status_path.exists():
+        return 0
+    try:
+        for line in status_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.startswith("VmRSS:"):
+                parts = line.split()
+                return int(int(parts[1]) / 1024) if len(parts) > 1 else 0
+    except Exception:
+        return 0
+    return 0
+
+
+def trim_process_memory() -> None:
+    gc.collect()
+    if os.name != "posix":
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def acquire_lock() -> None:
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     if LOCK_PATH.exists():
@@ -290,7 +316,18 @@ def discover_event_tasks(args: argparse.Namespace, amo: sync.AmoClient, store: s
     fallback = now - int(args.lookback_hours * 3600)
     from_ts = max(0, saved_ts - 60) if saved_ts else fallback
     trace_log(f"event scan start field_id={field_id} from={fmt_time(from_ts)} to={fmt_time(now)}")
-    events = amo.list_field_change_events(field_id, from_ts=from_ts, to_ts=now)
+    timeout = sync.env_int("AMO_EVENT_SCAN_HARD_TIMEOUT_SECONDS", 60)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(lambda: sync.AmoClient().list_field_change_events(field_id, from_ts=from_ts, to_ts=now))
+    try:
+        events = future.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        trace_log(f"event scan hard-timeout field_id={field_id} timeout={timeout}s")
+        executor.shutdown(wait=False, cancel_futures=True)
+        return [], 0, f"{fmt_time(from_ts)} - {fmt_time(now)}"
+    finally:
+        if future.done():
+            executor.shutdown(wait=False, cancel_futures=True)
     tasks = [{"kind": "event", "event": event} for event in events if not store.has_event(str(event.get("id") or ""))]
     period = f"{fmt_time(from_ts)} - {fmt_time(now)}"
     trace_log(f"event scan done seen={len(events)} new={len(tasks)}")
@@ -723,7 +760,7 @@ def run_monitor_cycle(
 ) -> None:
     check = LastCheck(checked_at=now_str())
     state.cycles += 1
-    trace_log(f"cycle {state.cycles} start dry_run={args.dry_run}")
+    trace_log(f"cycle {state.cycles} start dry_run={args.dry_run} rss_mb={process_memory_mb()}")
 
     if pending_batch(store):
         clear_pending_batch(store)
@@ -745,7 +782,8 @@ def run_monitor_cycle(
         save_updated_leads_cursor(args, amo, store, max_updated_at)
         state.last_check = check
         trace_log(f"cycle {state.cycles} done no tasks event_seen={event_seen} disk_seen={disk_seen}")
-        gc.collect()
+        trim_process_memory()
+        trace_log(f"cycle {state.cycles} memory after trim rss_mb={process_memory_mb()}")
         return
 
     check.total_tasks = len(tasks)
@@ -771,7 +809,8 @@ def run_monitor_cycle(
         state.last_error = "; ".join(check.notes[-3:]) or "Есть ошибки в последнем цикле"
     state.last_check = check
     trace_log(f"cycle {state.cycles} done tasks={check.processed_tasks} uploaded={check.uploaded} skipped={check.skipped} errors={check.errors}")
-    gc.collect()
+    trim_process_memory()
+    trace_log(f"cycle {state.cycles} memory after trim rss_mb={process_memory_mb()}")
 
 
 def apply_result(check: LastCheck, result: dict[str, int | str]) -> None:
