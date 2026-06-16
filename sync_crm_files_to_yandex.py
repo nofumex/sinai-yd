@@ -96,6 +96,25 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+class RequestRateLimiter:
+    def __init__(self, requests_per_second: float) -> None:
+        self.requests_per_second = max(float(requests_per_second), 0.1)
+        self._min_gap = 1.0 / self.requests_per_second
+        self._lock = threading.Lock()
+        self._last_request_at = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            wait_for = self._min_gap - (now - self._last_request_at)
+            if wait_for > 0:
+                time.sleep(wait_for)
+            self._last_request_at = time.monotonic()
+
+
+AMO_REQUEST_LIMITER = RequestRateLimiter(env_int("AMOCRM_RPS_LIMIT", 6))
+
+
 def safe_print(*values: Any, sep: str = " ", end: str = "\n", flush: bool = True) -> None:
     text = sep.join(str(value) for value in values) + end
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
@@ -497,19 +516,72 @@ class AmoClient:
         self.session.headers.update({"Authorization": f"Bearer {require_env('AMOCRM_ACCESS_TOKEN')}"})
         self.drive_url: str | None = None
 
+    def _retry_delay_seconds(self, response: requests.Response | None, attempt: int) -> float:
+        if response is not None:
+            retry_after = (response.headers.get("Retry-After") or "").strip()
+            if retry_after.isdigit():
+                return max(float(retry_after), 1.0)
+        return min(2.0 * attempt, 20.0)
+
+    def _request(
+        self,
+        method: str,
+        path_or_url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_payload: dict[str, Any] | None = None,
+        timeout: int | None = None,
+        absolute_url: bool = False,
+        stream: bool = False,
+    ) -> requests.Response:
+        url = path_or_url if absolute_url else f"{self.base_url}{path_or_url}"
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            response: requests.Response | None = None
+            try:
+                AMO_REQUEST_LIMITER.wait()
+                response = self.session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_payload,
+                    timeout=timeout or env_int("AMO_API_TIMEOUT_SECONDS", 20),
+                    stream=stream,
+                )
+                if response.status_code in {429, 500, 502, 503, 504}:
+                    if attempt < 3:
+                        delay = self._retry_delay_seconds(response, attempt)
+                        response.close()
+                        time.sleep(delay)
+                        continue
+                response.raise_for_status()
+                return response
+            except requests.RequestException as exc:
+                last_error = exc
+                if response is not None:
+                    response.close()
+                if attempt < 3:
+                    time.sleep(self._retry_delay_seconds(getattr(exc, "response", None), attempt))
+                    continue
+        raise last_error or RuntimeError(f"amoCRM request failed: {method} {url}")
+
     def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self.session.get(f"{self.base_url}{path}", params=params, timeout=env_int("AMO_API_TIMEOUT_SECONDS", 20))
+        response = self._request("GET", path, params=params)
         if response.status_code == 204:
+            response.close()
             return {}
-        response.raise_for_status()
-        return response.json()
+        payload = response.json()
+        response.close()
+        return payload
 
     def patch(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        response = self.session.patch(f"{self.base_url}{path}", json=payload, timeout=env_int("AMO_API_TIMEOUT_SECONDS", 20))
+        response = self._request("PATCH", path, json_payload=payload)
         if response.status_code == 204:
+            response.close()
             return {}
-        response.raise_for_status()
-        return response.json() if response.content else {}
+        body = response.json() if response.content else {}
+        response.close()
+        return body
 
     def list_embedded(self, path: str, key: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -533,9 +605,18 @@ class AmoClient:
         return self.drive_url
 
     def get_file_meta(self, file_uuid: str) -> dict[str, Any]:
-        response = self.session.get(f"{self.account_drive_url()}/v1.0/files/{file_uuid}", timeout=env_int("AMO_FILE_META_TIMEOUT_SECONDS", 20))
-        response.raise_for_status()
-        return response.json()
+        response = self._request(
+            "GET",
+            f"{self.account_drive_url()}/v1.0/files/{file_uuid}",
+            timeout=env_int("AMO_FILE_META_TIMEOUT_SECONDS", 20),
+            absolute_url=True,
+        )
+        payload = response.json()
+        response.close()
+        return payload
+
+    def stream_get(self, url: str, timeout: int) -> requests.Response:
+        return self._request("GET", url, timeout=timeout, absolute_url=True, stream=True)
 
     def list_pipeline_ids_by_names(self, names: set[str]) -> dict[int, str]:
         pipelines = self.list_embedded("/api/v4/leads/pipelines", "pipelines", {"limit": 250})
@@ -975,7 +1056,7 @@ def download_attachment(amo: AmoClient, item: Attachment, tmp_dir: Path) -> Path
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
-            with amo.session.get(download_url, stream=True, timeout=180) as response:
+            with amo.stream_get(download_url, timeout=180) as response:
                 response.raise_for_status()
                 with out_path.open("wb") as handle:
                     for chunk in response.iter_content(chunk_size=1024 * 512):
@@ -1109,7 +1190,7 @@ def sync_lead(
         safe_print("  no files")
         return stats
 
-    workers = upload_workers if upload_workers is not None else env_int("UPLOAD_WORKERS", env_int("YANDEX_UPLOAD_WORKERS", 8))
+    workers = upload_workers if upload_workers is not None else env_int("UPLOAD_WORKERS", env_int("YANDEX_UPLOAD_WORKERS", 3))
     workers = max(1, min(int(workers or 1), 32))
     queue: list[tuple[Attachment, str]] = []
 
@@ -1671,8 +1752,8 @@ def main() -> int:
     common.add_argument(
         "--upload-workers",
         type=int,
-        default=env_int("UPLOAD_WORKERS", env_int("YANDEX_UPLOAD_WORKERS", 8)),
-        help="Parallel file transfers per lead. Use 8-16 normally; too high can trigger API throttling.",
+        default=env_int("UPLOAD_WORKERS", env_int("YANDEX_UPLOAD_WORKERS", 3)),
+        help="Parallel file transfers per lead. Use 2-4 normally; higher values increase API and memory pressure.",
     )
 
     test_last = subparsers.add_parser("test-last", parents=[common], help="Upload attachments from latest CRM leads to test folders.")

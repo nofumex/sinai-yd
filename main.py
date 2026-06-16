@@ -1039,7 +1039,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run amoCRM -> Yandex Disk monitor.")
     parser.add_argument("--interval-seconds", type=int, default=int(sync.env("MONITOR_INTERVAL_SECONDS", "300")))
     parser.add_argument("--lookback-hours", type=float, default=float(sync.env("EVENT_LOOKBACK_HOURS", "24")))
-    parser.add_argument("--upload-workers", type=int, default=sync.env_int("UPLOAD_WORKERS", sync.env_int("YANDEX_UPLOAD_WORKERS", 8)))
+    parser.add_argument("--upload-workers", type=int, default=sync.env_int("UPLOAD_WORKERS", sync.env_int("YANDEX_UPLOAD_WORKERS", 3)))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--reset-panel", action="store_true", help="Delete the known panel message and create a fresh one.")
