@@ -565,8 +565,8 @@ class AmoClient:
                     continue
         raise last_error or RuntimeError(f"amoCRM request failed: {method} {url}")
 
-    def get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        response = self._request("GET", path, params=params)
+    def get(self, path: str, params: dict[str, Any] | None = None, timeout: int | float | None = None) -> dict[str, Any]:
+        response = self._request("GET", path, params=params, timeout=timeout)
         if response.status_code == 204:
             response.close()
             return {}
@@ -583,13 +583,27 @@ class AmoClient:
         response.close()
         return body
 
-    def list_embedded(self, path: str, key: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    def list_embedded(
+        self,
+        path: str,
+        key: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: int | float | None = None,
+        deadline_at: float | None = None,
+    ) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         page = 1
         params = dict(params or {})
         while True:
             params.update({"page": page})
-            payload = self.get(path, params)
+            request_timeout = timeout
+            if deadline_at is not None:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out while loading {path}")
+                request_timeout = min(float(timeout or env_int("AMO_API_TIMEOUT_SECONDS", 20)), max(1.0, remaining))
+            payload = self.get(path, params, timeout=request_timeout)
             batch = payload.get("_embedded", {}).get(key, []) or []
             result.extend(batch)
             if not batch or "next" not in payload.get("_links", {}):
@@ -718,6 +732,26 @@ class AmoClient:
             params["filter[created_at][to]"] = to_ts
         return self.list_embedded("/api/v4/events", "events", params)
 
+    def list_field_change_events_with_hard_timeout(
+        self,
+        field_id: int,
+        from_ts: int,
+        to_ts: int | None = None,
+        timeout_seconds: int = 60,
+    ) -> list[dict[str, Any]]:
+        event_type = f"custom_field_{field_id}_value_changed"
+        params: dict[str, Any] = {
+            "limit": 250,
+            "filter[entity]": "lead",
+            "filter[type][]": event_type,
+            "filter[created_at][from]": from_ts,
+            "order[created_at]": "asc",
+        }
+        if to_ts:
+            params["filter[created_at][to]"] = to_ts
+        deadline_at = time.monotonic() + max(timeout_seconds, 1)
+        return self.list_embedded("/api/v4/events", "events", params, deadline_at=deadline_at)
+
     def resolve_folder_field_id(self) -> int:
         configured = env("AMOCRM_YANDEX_FOLDER_FIELD_ID")
         if configured:
@@ -755,15 +789,17 @@ class AmoClient:
 
     def list_entity_files_with_hard_timeout(self, entity_type: str, entity_id: int, label: str) -> list[dict[str, Any]] | None:
         timeout = env_int("AMO_FILE_LIST_HARD_TIMEOUT_SECONDS", 30)
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(lambda: AmoClient().list_entity_files(entity_type, entity_id))
         try:
-            return future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
+            deadline_at = time.monotonic() + max(timeout, 1)
+            return self.list_embedded(
+                f"/api/v4/{entity_type}/{entity_id}/files",
+                "files",
+                {"limit": 250},
+                deadline_at=deadline_at,
+            )
+        except TimeoutError:
             print(f"  collect entity files hard-timeout: {label} timeout={timeout}s")
             return None
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
     def attachment_from_file_ref(
         self,

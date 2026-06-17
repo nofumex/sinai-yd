@@ -317,17 +317,11 @@ def discover_event_tasks(args: argparse.Namespace, amo: sync.AmoClient, store: s
     from_ts = max(0, saved_ts - 60) if saved_ts else fallback
     trace_log(f"event scan start field_id={field_id} from={fmt_time(from_ts)} to={fmt_time(now)}")
     timeout = sync.env_int("AMO_EVENT_SCAN_HARD_TIMEOUT_SECONDS", 60)
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(lambda: sync.AmoClient().list_field_change_events(field_id, from_ts=from_ts, to_ts=now))
     try:
-        events = future.result(timeout=timeout)
-    except concurrent.futures.TimeoutError:
+        events = sync.AmoClient().list_field_change_events_with_hard_timeout(field_id, from_ts=from_ts, to_ts=now, timeout_seconds=timeout)
+    except TimeoutError:
         trace_log(f"event scan hard-timeout field_id={field_id} timeout={timeout}s")
-        executor.shutdown(wait=False, cancel_futures=True)
         return [], 0, f"{fmt_time(from_ts)} - {fmt_time(now)}"
-    finally:
-        if future.done():
-            executor.shutdown(wait=False, cancel_futures=True)
     tasks = [{"kind": "event", "event": event} for event in events if not store.has_event(str(event.get("id") or ""))]
     period = f"{fmt_time(from_ts)} - {fmt_time(now)}"
     trace_log(f"event scan done seen={len(events)} new={len(tasks)}")
