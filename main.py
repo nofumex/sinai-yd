@@ -145,6 +145,20 @@ class TelegramUI:
             self.store.set_setting_int(PANEL_MESSAGE_KEY, message_id)
         return message_id
 
+    def send_admin_notice(self, text: str) -> None:
+        try:
+            self.api(
+                "sendMessage",
+                {
+                    "chat_id": self.admin_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+            )
+        except Exception as exc:
+            write_log(f"Telegram admin notice failed: {exc}")
+
     def edit_panel(self, text: str, keyboard: list[list[dict[str, str]]]) -> None:
         if not self.enabled:
             return
@@ -609,8 +623,17 @@ def process_task_logged(
     label = task_log_label(task)
     trace_log(f"task start {label}")
     buffer = TeeBuffer()
-    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
-        result = process_task(task, args, amo, disk, store)
+    try:
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            result = process_task(task, args, amo, disk, store)
+    except Exception as exc:
+        output = buffer.getvalue().strip()
+        if output:
+            write_log(output)
+        trace_log(f"task error {label}: {exc}")
+        notify_task_error(store, task, label, exc)
+        mark_failed_task_seen(task, store, exc)
+        return {"uploaded": 0, "skipped": 0, "errors": 1, "label": f"{label} error: {exc}"}
     output = buffer.getvalue().strip()
     if output:
         write_log(output)
@@ -618,8 +641,37 @@ def process_task_logged(
         f"task done {label} uploaded={int(result.get('uploaded') or 0)} "
         f"skipped={int(result.get('skipped') or 0)} errors={int(result.get('errors') or 0)}"
     )
+    if int(result.get("errors") or 0):
+        notify_task_error(store, task, label, RuntimeError(str(result.get("label") or "task failed")))
     return result
 
+
+def notify_task_error(store: sync.Store, task: dict[str, Any], label: str, exc: Exception) -> None:
+    links = task_public_links(task)
+    lines = [
+        "<b>\u041e\u0448\u0438\u0431\u043a\u0430 \u0441\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u0438 \u042f\u043d\u0434\u0435\u043a\u0441.\u0414\u0438\u0441\u043a\u0430</b>",
+        f"\u0417\u0430\u0434\u0430\u0447\u0430: {html(label)}",
+        f"\u041f\u0440\u0438\u0447\u0438\u043d\u0430: {html(exc)}",
+    ]
+    if links.get("crm"):
+        lines.append(f"CRM: {html(links['crm'])}")
+    if links.get("disk"):
+        lines.append(f"\u0414\u0438\u0441\u043a: {html(links['disk'])}")
+    lines.append("\u041f\u0430\u043f\u043a\u0430 \u043a\u043b\u0438\u0435\u043d\u0442\u0430 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u0432\u0430\u043b\u0430\u0441\u044c \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043f\u0443\u0442\u044c \u0432 \u043f\u043e\u043b\u0435 CRM.")
+    TelegramUI(store).send_admin_notice("\n".join(lines))
+
+
+def mark_failed_task_seen(task: dict[str, Any], store: sync.Store, exc: Exception) -> None:
+    if not isinstance(exc, (sync.MissingClientFolderError, ValueError)):
+        return
+    if task.get("kind") == "event" and task.get("event"):
+        store.save_event(task["event"])
+    elif task.get("kind") == "disk_folder" and task.get("folder_path") and task.get("lead_id"):
+        store.save_disk_folder(
+            str(task["folder_path"]),
+            int(task["lead_id"]),
+            sync.yandex_client_url(str(task["folder_path"])),
+        )
 
 def process_event_task(task: dict[str, Any], args: argparse.Namespace, amo: sync.AmoClient, disk: sync.YandexDiskClient, store: sync.Store) -> dict[str, int | str]:
     event = task.get("event") or {}
@@ -655,7 +707,7 @@ def process_event_task(task: dict[str, Any], args: argparse.Namespace, amo: sync
         except ValueError as exc:
             if not args.dry_run:
                 store.save_event(event)
-            return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"lead {lead_id} skipped folder outside root: {exc}"}
+            return {"uploaded": 0, "skipped": 0, "errors": 1, "label": f"lead {lead_id} invalid folder path: {exc}"}
     attachments = task.get("_attachments")
     stats = sync.sync_lead(
         amo,
@@ -742,7 +794,7 @@ def process_updated_lead_task(task: dict[str, Any], args: argparse.Namespace, am
     try:
         folder = sync.crm_files_folder_from_field_value(raw_folder, disk)
     except ValueError as exc:
-        return {"uploaded": 0, "skipped": 1, "errors": 0, "label": f"updated lead {lead_id} skipped folder outside root: {exc}"}
+        return {"uploaded": 0, "skipped": 0, "errors": 1, "label": f"updated lead {lead_id} invalid folder path: {exc}"}
     stats = sync.sync_lead(
         amo,
         disk,
@@ -889,6 +941,11 @@ def task_public_links(task: dict[str, Any]) -> dict[str, str]:
         return {
             "crm": f"{sync.env('AMOCRM_BASE_URL').rstrip('/')}/leads/detail/{int(task.get('lead_id') or 0)}",
             "disk": sync.yandex_client_url(str(task.get("folder_path") or "")),
+        }
+    if task.get("kind") == "updated_lead":
+        return {
+            "crm": f"{sync.env('AMOCRM_BASE_URL').rstrip('/')}/leads/detail/{int(task.get('lead_id') or 0)}",
+            "disk": "",
         }
     return {"crm": "", "disk": ""}
 

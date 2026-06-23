@@ -209,9 +209,17 @@ def extract_markdown_url(value: str) -> str:
     return "".join(chars).strip()
 
 
+class MissingClientFolderError(ValueError):
+    pass
+
+
+def crm_files_subfolder_name() -> str:
+    return env("YANDEX_CRM_FILES_SUBFOLDER", "\u0424\u0430\u0439\u043b\u044b \u0438\u0437 CRM").strip().strip("/\\")
+
+
 def crm_files_folder(client_folder: str) -> str:
     folder = normalize_disk_path(client_folder)
-    subfolder = env("YANDEX_CRM_FILES_SUBFOLDER", "Файлы из CRM").strip().strip("/\\")
+    subfolder = crm_files_subfolder_name()
     if not subfolder:
         return folder
     if folder.lower().replace("\\", "/").endswith("/" + subfolder.lower()):
@@ -219,6 +227,23 @@ def crm_files_folder(client_folder: str) -> str:
     if folder.lower() == subfolder.lower():
         return folder
     return f"{folder}/{subfolder}"
+
+
+def crm_client_folder_from_files_folder(folder_path: str) -> str:
+    folder = normalize_disk_path(folder_path)
+    subfolder = crm_files_subfolder_name()
+    if not subfolder:
+        return folder
+    folder_key = folder.casefold()
+    subfolder_key = subfolder.casefold()
+    suffix = "/" + subfolder_key
+    if folder_key.endswith(suffix):
+        client_folder = folder[: -(len(subfolder) + 1)]
+        if client_folder:
+            return client_folder
+    if folder_key == subfolder_key:
+        raise MissingClientFolderError(f"client folder is missing before disk:/{folder}")
+    return folder
 
 
 def configured_disk_root() -> str:
@@ -963,24 +988,43 @@ class YandexDiskClient:
         current = ""
         for part in parts:
             current = f"{current}/{part}" if current else part
-            if self.exists(current):
+            self.ensure_single_folder(current)
+
+    def ensure_crm_files_folder(self, folder_path: str) -> None:
+        target = crm_files_folder(folder_path)
+        client_folder = crm_client_folder_from_files_folder(target)
+        root = configured_disk_root()
+        if normalize_disk_path(client_folder).casefold() == root.casefold():
+            raise MissingClientFolderError(
+                f"Yandex Disk path points to the root, not to a client folder: disk:/{client_folder}"
+            )
+        if not self.exists(client_folder):
+            raise MissingClientFolderError(
+                f"client folder does not exist, so it was not created automatically: disk:/{client_folder}"
+            )
+        if target != client_folder:
+            self.ensure_single_folder(target)
+
+    def ensure_single_folder(self, folder_path: str) -> None:
+        path = normalize_disk_path(folder_path)
+        if self.exists(path):
+            return
+        last_response: requests.Response | None = None
+        for attempt in range(1, 4):
+            response = self.session.put(
+                "https://cloud-api.yandex.net/v1/disk/resources",
+                params={"path": path},
+                timeout=90,
+            )
+            if response.status_code in {201, 409}:
+                return
+            if response.status_code == 423 and attempt < 3:
+                time.sleep(attempt * 2)
                 continue
-            last_response: requests.Response | None = None
-            for attempt in range(1, 4):
-                response = self.session.put(
-                    "https://cloud-api.yandex.net/v1/disk/resources",
-                    params={"path": current},
-                    timeout=90,
-                )
-                if response.status_code in {201, 409}:
-                    break
-                if response.status_code == 423 and attempt < 3:
-                    time.sleep(attempt * 2)
-                    continue
-                last_response = response
-                break
-            if last_response is not None:
-                last_response.raise_for_status()
+            last_response = response
+            break
+        if last_response is not None:
+            last_response.raise_for_status()
 
     def exists(self, path: str) -> bool:
         response = self.session.get(
@@ -1223,7 +1267,7 @@ def sync_lead(
     safe_print(f"  target: disk:/{folder}")
 
     if not dry_run:
-        disk.ensure_folder(folder)
+        disk.ensure_crm_files_folder(folder)
 
     attachments = attachments if attachments is not None else amo.collect_attachments(
         lead,
