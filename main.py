@@ -6,6 +6,7 @@ import concurrent.futures
 import contextlib
 import ctypes
 import gc
+import hashlib
 import io
 import json
 import os
@@ -647,6 +648,9 @@ def process_task_logged(
 
 
 def notify_task_error(store: sync.Store, task: dict[str, Any], label: str, exc: Exception) -> None:
+    if not should_send_error_notice(store, task, label, exc):
+        trace_log(f"task error notice suppressed {label}: {exc}")
+        return
     links = task_public_links(task)
     lines = [
         "<b>\u041e\u0448\u0438\u0431\u043a\u0430 \u0441\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u0438 \u042f\u043d\u0434\u0435\u043a\u0441.\u0414\u0438\u0441\u043a\u0430</b>",
@@ -659,6 +663,21 @@ def notify_task_error(store: sync.Store, task: dict[str, Any], label: str, exc: 
         lines.append(f"\u0414\u0438\u0441\u043a: {html(links['disk'])}")
     lines.append("\u041f\u0430\u043f\u043a\u0430 \u043a\u043b\u0438\u0435\u043d\u0442\u0430 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u0432\u0430\u043b\u0430\u0441\u044c \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438. \u041f\u0440\u043e\u0432\u0435\u0440\u044c\u0442\u0435 \u043f\u0443\u0442\u044c \u0432 \u043f\u043e\u043b\u0435 CRM.")
     TelegramUI(store).send_admin_notice("\n".join(lines))
+
+
+def should_send_error_notice(store: sync.Store, task: dict[str, Any], label: str, exc: Exception) -> bool:
+    ttl = sync.env_int("TG_ERROR_NOTICE_TTL_SECONDS", 3600)
+    if ttl <= 0:
+        return True
+    key_source = f"{task.get('kind')}|{task_lead_id(task)}|{label}|{exc}"
+    digest = hashlib.sha1(key_source.encode("utf-8", errors="replace")).hexdigest()
+    key = f"tg_error_notice_at_{digest}"
+    now = int(time.time())
+    last_sent = store.get_setting_int(key, 0)
+    if last_sent and now - last_sent < ttl:
+        return False
+    store.set_setting_int(key, now)
+    return True
 
 
 def mark_failed_task_seen(task: dict[str, Any], store: sync.Store, exc: Exception) -> None:
