@@ -21,6 +21,21 @@ class DiskPathTests(unittest.TestCase):
         self.assertEqual(sync.normalize_disk_path("  disk:/root/Client Name  "), "root/Client Name")
 
 
+class CrmFieldValueTests(unittest.TestCase):
+    def test_lead_folder_value_preserves_trailing_space(self) -> None:
+        lead = {"custom_fields_values": [{"field_id": 7, "values": [{"value": "root/Client "}]}]}
+
+        self.assertEqual(sync.lead_folder_value(lead, 7), "root/Client ")
+
+    def test_event_folder_value_preserves_trailing_space(self) -> None:
+        event = {"value_after": [{"custom_field_value": {"field_id": 7, "text": "root/Client "}}]}
+
+        self.assertEqual(sync.event_folder_value(event, 7), "root/Client ")
+
+    def test_blank_crm_field_value_is_empty(self) -> None:
+        self.assertEqual(sync.crm_field_text("   "), "")
+
+
 class FakeDisk(sync.YandexDiskClient):
     def __init__(self, existing: set[str]) -> None:
         self.existing = set(existing)

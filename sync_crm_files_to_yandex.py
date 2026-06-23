@@ -1106,6 +1106,11 @@ class YandexDiskClient:
             time.sleep(1)
 
 
+def crm_field_text(value: Any) -> str:
+    text = str(value or "")
+    return text if text.strip() else ""
+
+
 def lead_folder_value(lead: dict[str, Any], field_id: int) -> str:
     for field in lead.get("custom_fields_values") or []:
         if int(field.get("field_id") or 0) != field_id:
@@ -1113,7 +1118,7 @@ def lead_folder_value(lead: dict[str, Any], field_id: int) -> str:
         values = field.get("values") or []
         if not values:
             return ""
-        return str(values[0].get("value") or "").strip()
+        return crm_field_text(values[0].get("value"))
     return ""
 
 
@@ -1706,7 +1711,7 @@ def event_folder_value(event: dict[str, Any], field_id: int) -> str:
         custom = value.get("custom_field_value") or {}
         if int(custom.get("field_id") or 0) != field_id:
             continue
-        return str(custom.get("text") or custom.get("value") or "").strip()
+        return crm_field_text(custom.get("text") or custom.get("value"))
     return ""
 
 
