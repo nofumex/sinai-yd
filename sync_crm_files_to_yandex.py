@@ -165,12 +165,10 @@ def normalize_disk_path(raw: str) -> str:
             )
 
     value = value.replace("\\", "/")
-    value = re.sub(r"/+", "/", value).strip()
-    if value.startswith("/"):
-        value = value[1:]
+    value = re.sub(r"/+", "/", value).strip("/")
     if not value:
         raise ValueError("empty Yandex Disk folder path")
-    return value.strip("/")
+    return value
 
 
 def extract_disk_value(raw: str) -> str:
@@ -281,8 +279,19 @@ def crm_files_folder_from_field_value(raw_folder: str, disk: "YandexDiskClient")
 
 
 def yandex_client_url(folder_path: str) -> str:
-    path = normalize_disk_path(folder_path)
+    path = normalize_disk_path_for_client_url(folder_path)
     return "https://disk.yandex.ru/client/disk/" + quote_readable_disk_path(path)
+
+
+def normalize_disk_path_for_client_url(raw: str) -> str:
+    value = str(raw or "")
+    if re.match(r"\s*(?:disk:|yadisk:|https?://)", value):
+        return normalize_disk_path(value)
+    value = value.replace("\\", "/")
+    value = re.sub(r"/+", "/", value).strip("/")
+    if not value:
+        raise ValueError("empty Yandex Disk folder path")
+    return value
 
 
 def quote_readable_disk_path(path: str) -> str:

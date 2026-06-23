@@ -78,13 +78,28 @@ class TelegramUI:
     def api(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         if not self.enabled:
             return {}
-        response = self.session.post(f"{self.base_url}/{method}", json=payload, timeout=45)
-        if response.status_code >= 400:
-            raise RuntimeError(response.text)
-        data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(data)
-        return data.get("result") or {}
+        for attempt in range(1, 4):
+            response = self.session.post(f"{self.base_url}/{method}", json=payload, timeout=45)
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            if response.status_code == 429:
+                retry_after = int((data.get("parameters") or {}).get("retry_after") or 5)
+                if attempt < 3:
+                    time.sleep(max(retry_after, 1))
+                    continue
+            if response.status_code >= 400:
+                raise RuntimeError(response.text)
+            if not data.get("ok"):
+                if str(data.get("error_code") or "") == "429":
+                    retry_after = int((data.get("parameters") or {}).get("retry_after") or 5)
+                    if attempt < 3:
+                        time.sleep(max(retry_after, 1))
+                        continue
+                raise RuntimeError(data)
+            return data.get("result") or {}
+        raise RuntimeError(f"Telegram API {method} failed after retries")
 
     def get_updates(self) -> list[dict[str, Any]]:
         if not self.enabled:
